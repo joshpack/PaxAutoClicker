@@ -39,7 +39,7 @@ It uses Windows-only APIs (low-level keyboard and mouse hooks, `SendInput`, glob
 ## Install
 
 1. Install the **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (x64) if you don't have it.
-2. Download `PaxAutoClicker-1.1.0-win-x64.zip` from **[the latest release](https://github.com/joshpack/PaxAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash PaxAutoClicker-1.1.0-win-x64.zip` and compare the result with the `.sha256` file next to it.
+2. Download `PaxAutoClicker-1.1.1-win-x64.zip` from **[the latest release](https://github.com/joshpack/PaxAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash PaxAutoClicker-1.1.1-win-x64.zip` and compare the result with the `.sha256` file next to it.
 3. Unzip it somewhere permanent. It contains one folder, `PaxAutoClicker`. To update, quit the app and replace that folder; your settings are kept.
 4. Run `PaxAutoClicker.exe`.
 
