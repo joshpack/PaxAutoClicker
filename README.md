@@ -21,7 +21,7 @@
 - **Sounds you can hear over games.** A rising chime when hold mode turns on and a falling one when it turns off, with a volume slider (0 turns them off). They play through the normal Windows mixer, so they show up in the volume mixer.
 - **See or hear every click.** A green ring flashes where each click lands. Fullscreen games hide windows drawn on top of them, so there's also an optional soft **tick sound** for each click.
 - **Shift + F12** shows or hides the window from anywhere, including from inside a game.
-- **Tray app.** Minimizing hides it to the tray; double-click the tray icon or use its menu to bring it back. Untick **Show tray icon** to run without one: minimizing then keeps it on the taskbar, and starting the exe again opens the window.
+- **Tray app.** Minimizing, the window's **X**, Alt+F4 and the taskbar's Close all hide it to the tray instead of quitting, so it keeps working in the background; double-click the tray icon or use its menu to bring it back. To quit, use the **Exit** button in the window or **Exit** in the tray menu. Untick **Show tray icon** to run without one: minimizing then keeps it on the taskbar, and starting the exe again opens the window.
 - **One copy at a time.** Starting it again while it runs brings up the running window. The window remembers where you left it.
 - **Works with [PAX Toolkit](https://github.com/joshpack/PaxToolkit)**, including turning the tray icon on or off from there.
 - **Start with Windows**, optional. It starts hidden in the tray with hold mode already on, silently.
@@ -70,7 +70,7 @@ Settings and the window position are saved when the app closes, in the registry 
 
 ## Uninstall
 
-Untick **Start with Windows**, quit (the window's close button or the tray menu), and delete the folder. To remove the settings too, delete `HKEY_CURRENT_USER\Software\PaxAutoClicker`.
+Untick **Start with Windows**, quit (the **Exit** button in the window, or **Exit** in the tray menu), and delete the folder. To remove the settings too, delete `HKEY_CURRENT_USER\Software\PaxAutoClicker`.
 
 ## Build from source
 

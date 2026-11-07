@@ -149,6 +149,7 @@ sealed class PaxTitleBar : Control
     int hot = -1, pressed = -1; // 0 = minimize, 1 = close
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public string CloseTip { get; set; } = "Close";
+    public Action? CloseAction; // replaces closing the form when the X is clicked
 
     public PaxTitleBar(string title, Bitmap? icon)
     {
@@ -234,7 +235,7 @@ sealed class PaxTitleBar : Control
         int p = pressed;
         pressed = -1;
         if (e.Button != MouseButtons.Left || p < 0 || HitButton(e.Location) != p || FindForm() is not { } f) return;
-        if (p == 0) f.WindowState = FormWindowState.Minimized; else f.Close();
+        if (p == 0) f.WindowState = FormWindowState.Minimized; else if (CloseAction != null) CloseAction(); else f.Close();
     }
 
     protected override void Dispose(bool disposing)
@@ -593,7 +594,7 @@ class ClickerForm : Form
     readonly PaxCheckBox chkTray = new() { Text = "Show tray icon", Checked = true };
     readonly NotifyIcon tray = new() { Icon = AppIcon(SystemInformation.SmallIconSize), Text = "PAX Auto Clicker (Shift+F12 to open)" };
     readonly Panel body = new() { Dock = DockStyle.Fill };
-    readonly PaxTitleBar bar = new("PAX Auto Clicker", AppIcon(new Size(64, 64)).ToBitmap()) { CloseTip = "Quit" };
+    readonly PaxTitleBar bar = new("PAX Auto Clicker", AppIcon(new Size(64, 64)).ToBitmap()) { CloseTip = "Hide (use Exit to quit)" };
     readonly EventWaitHandle? showRequest;
     RegisteredWaitHandle? showWait;
     IDisposable? linkWatch;
@@ -641,7 +642,8 @@ class ClickerForm : Form
     readonly PaxTrackBar tbVolume = new() { Minimum = 0, Maximum = 100, Value = 70, TickFrequency = 10, Width = 120, AutoSize = false, Height = 28 };
     readonly Label lblVolume = new() { AutoSize = true, ForeColor = PaxTheme.Muted };
     readonly Button btn = new() { Text = "Start", Width = 120, Height = 36 };
-    readonly Label status = new() { AutoSize = true, Text = "Stopped" };
+    readonly Label status = new() { AutoSize = false, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
+    readonly Button btnExit = new() { Text = "Exit", Width = 70, Height = 36 };
     CancellationTokenSource? cts;
     long clicks;
 
@@ -738,7 +740,7 @@ class ClickerForm : Form
         });
         tray.ContextMenuStrip = new ContextMenuStrip();
         tray.ContextMenuStrip.Items.Add("Show", null, (_, _) => RestoreFromTray());
-        tray.ContextMenuStrip.Items.Add("Exit", null, (_, _) => { tray.Visible = false; Close(); });
+        tray.ContextMenuStrip.Items.Add("Exit", null, (_, _) => ExitApp());
         tray.DoubleClick += (_, _) => RestoreFromTray();
         // without a tray icon, minimizing keeps the window on the taskbar instead of hiding it
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && tray.Visible) Hide(); };
@@ -748,8 +750,10 @@ class ClickerForm : Form
         };
 
         btn.Left = 14; btn.Top = y + 6; btn.Click += (_, _) => Toggle();
-        status.Left = 150; status.Top = y + 15;
-        body.Controls.Add(btn); body.Controls.Add(status);
+        btnExit.Left = 380 - 14 - btnExit.Width; btnExit.Top = y + 6; btnExit.Click += (_, _) => ExitApp();
+        PaxTheme.RaisedButton(btnExit);
+        status.Bounds = new Rectangle(btn.Right + 12, y + 6, btnExit.Left - btn.Right - 18, 36); // wraps to two lines if needed
+        body.Controls.Add(btn); body.Controls.Add(status); body.Controls.Add(btnExit);
 
         HandleCreated += (_, _) =>
         {
@@ -762,8 +766,19 @@ class ClickerForm : Form
                     try { if (IsHandleCreated && !IsDisposed) BeginInvoke(RestoreFromTray); } catch (InvalidOperationException) { }
                 }, null, Timeout.Infinite, false);
         };
-        FormClosing += (_, _) => { showWait?.Unregister(null); linkWatch?.Dispose(); if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId); };
+        // X only hides; Alt+F4 and the taskbar's Close are caught in WndProc. A plain WM_CLOSE (PAX Toolkit
+        // closing it to update, Windows shutdown) still quits normally so settings get saved.
+        bar.CloseAction = HideWindow;
+        FormClosing += (_, _) =>
+        {
+            showWait?.Unregister(null); linkWatch?.Dispose(); if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId);
+        };
     }
+
+    void ExitApp() { tray.Visible = false; Close(); }
+
+    // with no tray icon a hidden window couldn't be found again (except Shift+F12), so minimize to the taskbar instead
+    void HideWindow() { if (tray.Visible) Hide(); else WindowState = FormWindowState.Minimized; }
 
     // borderless, but keeps a drop shadow and the taskbar minimize/restore behaviour
     protected override CreateParams CreateParams
@@ -824,6 +839,10 @@ class ClickerForm : Form
                 r.DeleteValue(LegacyRunName, false);
                 r.SetValue(RunName, $"\"{Environment.ProcessPath}\" --autostart");
             }
+            // keep "Start with Windows" pointing at this copy (e.g. after PAX Toolkit installs it somewhere new)
+            string runValue = $"\"{Environment.ProcessPath}\" --autostart";
+            if (r?.GetValue(RunName) is string current && !string.Equals(current, runValue, StringComparison.OrdinalIgnoreCase))
+                r.SetValue(RunName, runValue);
             chkAuto.Checked = r?.GetValue(RunName) != null;
         }
         catch { }
@@ -1052,6 +1071,8 @@ class ClickerForm : Form
         {
             if (Visible && WindowState != FormWindowState.Minimized) Hide(); else RestoreFromTray();
         }
+        // Alt+F4 and the taskbar's Close arrive as SC_CLOSE: hide instead of quitting
+        else if (m.Msg == 0x0112 && ((int)m.WParam & 0xFFF0) == 0xF060) { HideWindow(); return; }
         base.WndProc(ref m);
     }
 
