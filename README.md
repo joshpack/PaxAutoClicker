@@ -7,7 +7,7 @@
 **A small Windows auto clicker that stays out of your way.** Click at a set rate with a hotkey, or hold a key and the left mouse button to spam clicks only while you want them. It lives in the tray, starts with Windows if you like, and tells you with a sound when it turns on or off, even over a fullscreen game.
 
 <p align="center">
-  <img src="docs/screenshots/main.png" width="380" alt="The PAX Auto Clicker window: 20 clicks per second, left button, F6 start/stop hotkey, Page Down hold-mode key, Shift held with left click, sound volume at 70%, and hold mode, click circle, tick sound and Start with Windows all ticked">
+  <img src="docs/screenshots/main.png" width="380" alt="The PAX Auto Clicker window in the dark PAX theme with a green Start button: 20 clicks per second, left button, F6 start/stop hotkey, Page Down hold-mode key, Shift held with left click, sound volume at 70%, and hold mode, click circle, tick sound, Start with Windows and Show tray icon all ticked">
 </p>
 
 ## Features
@@ -21,7 +21,9 @@
 - **Sounds you can hear over games.** A rising chime when hold mode turns on and a falling one when it turns off, with a volume slider (0 turns them off). They play through the normal Windows mixer, so they show up in the volume mixer.
 - **See or hear every click.** A green ring flashes where each click lands. Fullscreen games hide windows drawn on top of them, so there's also an optional soft **tick sound** for each click.
 - **Shift + F12** shows or hides the window from anywhere, including from inside a game.
-- **Tray app.** Minimizing hides it to the tray; double-click the tray icon or use its menu to bring it back.
+- **Tray app.** Minimizing hides it to the tray; double-click the tray icon or use its menu to bring it back. Untick **Show tray icon** to run without one: minimizing then keeps it on the taskbar, and starting the exe again opens the window.
+- **One copy at a time.** Starting it again while it runs brings up the running window. The window remembers where you left it.
+- **Works with [PAX Toolkit](https://github.com/joshpack/PaxToolkit)**, including turning the tray icon on or off from there.
 - **Start with Windows**, optional. It starts hidden in the tray with hold mode already on, silently.
 - **No install, no admin rights.** One folder; settings live in the current user's registry.
 
@@ -37,7 +39,7 @@ It uses Windows-only APIs (low-level keyboard and mouse hooks, `SendInput`, glob
 ## Install
 
 1. Install the **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (x64) if you don't have it.
-2. Download `PaxAutoClicker-1.0.0-win-x64.zip` from **[the latest release](https://github.com/joshpack/PaxAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash PaxAutoClicker-1.0.0-win-x64.zip` and compare the result with the `.sha256` file next to it.
+2. Download `PaxAutoClicker-1.1.0-win-x64.zip` from **[the latest release](https://github.com/joshpack/PaxAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash PaxAutoClicker-1.1.0-win-x64.zip` and compare the result with the `.sha256` file next to it.
 3. Unzip it somewhere permanent. It contains one folder, `PaxAutoClicker`. To update, quit the app and replace that folder; your settings are kept.
 4. Run `PaxAutoClicker.exe`.
 
@@ -64,11 +66,11 @@ If another program already uses the start/stop key or Shift + F12, the status li
 
 ## Settings
 
-Settings are saved when the app closes, in the registry under `HKEY_CURRENT_USER\Software\PaxAutoClicker`. "Start with Windows" is the `PaxAutoClicker` value under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`. Settings from older builds named "Auto Clicker" are picked up automatically.
+Settings and the window position are saved when the app closes, in the registry under `HKEY_CURRENT_USER\Software\PaxAutoClicker`. Whether the tray icon shows is kept in `%APPDATA%\PAX\toolkit.json` (`apps.PaxAutoClicker.trayIcon`), shared with PAX Toolkit. "Start with Windows" is the `PaxAutoClicker` value under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`. Settings from older builds named "Auto Clicker" are picked up automatically.
 
 ## Uninstall
 
-Untick **Start with Windows**, quit from the tray menu, and delete the folder. To remove the settings too, delete `HKEY_CURRENT_USER\Software\PaxAutoClicker`.
+Untick **Start with Windows**, quit (the window's close button or the tray menu), and delete the folder. To remove the settings too, delete `HKEY_CURRENT_USER\Software\PaxAutoClicker`.
 
 ## Build from source
 
@@ -85,5 +87,7 @@ Everything is in `Program.cs`:
 
 - `ClickerForm`: the window, settings, hotkeys, the keyboard hook that handles the bindable keys, the hold-mode mouse hook and click loop, and the chimes and tick, which are synthesized in memory as WAV data (no sound files).
 - `ClickRing`: a click-through, transparent overlay that flashes a fading ring where each click lands.
+- `PaxTitleBar`: the dark PAX title bar (icon, name, minimize and close) that replaces the Windows one.
+- `SingleInstance`, `PaxLink`, `PaxPlacement`: one copy at a time, the PAX Toolkit tray-icon setting, and the saved window position.
 
 `app.ico` is the icon, built into the exe and used for the window and tray.

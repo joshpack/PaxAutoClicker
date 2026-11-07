@@ -1,7 +1,575 @@
 using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
-ApplicationConfiguration.Initialize();
-Application.Run(new ClickerForm());
+App.Run(args);
+
+static class App
+{
+    public const string Id = "PaxAutoClicker";
+
+    public static void Run(string[] args)
+    {
+        // A second launch hands over to the running copy (which shows its window) and exits.
+        using var single = SingleInstance.Claim(@"Local\PaxAutoClicker.Instance", @"Local\PaxAutoClicker.Show", signalIfRunning: !args.Contains("--autostart"));
+        if (single == null) return;
+        ApplicationConfiguration.Initialize();
+        Application.Run(new ClickerForm(single.ShowRequest));
+    }
+}
+
+// One copy per user session: a named mutex says who runs, a named event asks the running copy to show its window.
+sealed class SingleInstance : IDisposable
+{
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
+    readonly Mutex mutex;
+    public EventWaitHandle ShowRequest { get; }
+
+    SingleInstance(Mutex m, EventWaitHandle e) { mutex = m; ShowRequest = e; }
+
+    // Returns null when another copy already runs (after asking it to show itself if signalIfRunning).
+    public static SingleInstance? Claim(string mutexName, string eventName, bool signalIfRunning)
+    {
+        var ev = new EventWaitHandle(false, EventResetMode.AutoReset, eventName);
+        var m = new Mutex(true, mutexName, out bool first);
+        if (first) return new SingleInstance(m, ev);
+        if (signalIfRunning)
+        {
+            AllowSetForegroundWindow(-1); // ASFW_ANY: let the running copy come to the front
+            ev.Set();
+        }
+        m.Dispose(); ev.Dispose();
+        return null;
+    }
+
+    public void Dispose()
+    {
+        try { mutex.ReleaseMutex(); } catch { }
+        mutex.Dispose(); ShowRequest.Dispose();
+    }
+}
+
+// PAX Toolkit link: %APPDATA%\PAX\toolkit.json -> apps.<id>.trayIcon (default true). PAX_SHARED_DIR overrides the folder.
+static class PaxLink
+{
+    public static string SharedDir =>
+        Environment.GetEnvironmentVariable("PAX_SHARED_DIR") is { Length: > 0 } d
+            ? d
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PAX");
+
+    public static string FilePath => Path.Combine(SharedDir, "toolkit.json");
+
+    public static bool TrayIconVisible(string appId) =>
+        Read()?["apps"]?[appId]?["trayIcon"] is JsonValue v && v.TryGetValue(out bool on) ? on : true;
+
+    // Changes only this app's entry; other apps' entries and other keys are kept. Written via a temp file + move.
+    public static void SetTrayIconVisible(string appId, bool visible)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                var root = Read() as JsonObject ?? new JsonObject { ["schema"] = 1 };
+                var apps = root["apps"] as JsonObject ?? new JsonObject();
+                root["apps"] = apps;
+                var entry = apps[appId] as JsonObject ?? new JsonObject();
+                apps[appId] = entry;
+                entry["trayIcon"] = visible;
+                Directory.CreateDirectory(SharedDir);
+                var tmp = FilePath + "." + Environment.ProcessId + ".tmp";
+                File.WriteAllText(tmp, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                File.Move(tmp, FilePath, overwrite: true);
+                return;
+            }
+            catch (IOException) { Thread.Sleep(100); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(100); }
+        }
+    }
+
+    // Calls changed (on a worker thread) 250 ms after the last change to toolkit.json.
+    public static IDisposable? Watch(Action changed)
+    {
+        try
+        {
+            Directory.CreateDirectory(SharedDir);
+            var w = new FileSystemWatcher(SharedDir, "toolkit.json") { NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime };
+            System.Threading.Timer? debounce = null;
+            void Fire(object? _, FileSystemEventArgs __)
+            {
+                debounce?.Dispose();
+                debounce = new System.Threading.Timer(_ => changed(), null, 250, Timeout.Infinite);
+            }
+            w.Changed += Fire;
+            w.Created += Fire;
+            w.Deleted += Fire;
+            w.Renamed += (s, e) => Fire(s, e);
+            w.EnableRaisingEvents = true;
+            return w;
+        }
+        catch { return null; }
+    }
+
+    static JsonNode? Read()
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try { return File.Exists(FilePath) ? JsonNode.Parse(File.ReadAllText(FilePath)) : null; }
+            catch (IOException) { Thread.Sleep(50); }
+            catch { return null; } // damaged file: treat as empty
+        }
+        return null;
+    }
+}
+
+static class PaxPlacement
+{
+    // A saved spot counts only if a real part of the title bar lands in some screen's working area.
+    public static bool IsVisible(Rectangle window, int barHeight, IEnumerable<Rectangle> workAreas)
+    {
+        var bar = new Rectangle(window.X, window.Y, window.Width, barHeight);
+        return workAreas.Any(a => { var i = Rectangle.Intersect(a, bar); return i.Width >= Math.Min(80, window.Width) && i.Height >= barHeight / 2; });
+    }
+
+    public static bool IsVisible(Rectangle window, int barHeight) =>
+        IsVisible(window, barHeight, Screen.AllScreens.Select(s => s.WorkingArea));
+}
+
+// The PAX title bar: 38 px #0A0D12 with a 1 px #1B2030 line under it, the app icon (18 px) and name on the left,
+// minimize and close (46x38) at the right. Empty bar area drags the window.
+sealed class PaxTitleBar : Control
+{
+    static readonly Color Back = ColorTranslator.FromHtml("#0A0D12"), Line = ColorTranslator.FromHtml("#1B2030"),
+        Fore = ColorTranslator.FromHtml("#C9CED9"), Hover = ColorTranslator.FromHtml("#1F2533"), CloseHover = ColorTranslator.FromHtml("#E81123");
+    [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    const int WM_NCLBUTTONDOWN = 0xA1, HTCAPTION = 2;
+
+    readonly Bitmap? icon;
+    readonly ToolTip tip = new();
+    int hot = -1, pressed = -1; // 0 = minimize, 1 = close
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public string CloseTip { get; set; } = "Close";
+
+    public PaxTitleBar(string title, Bitmap? icon)
+    {
+        Text = title;
+        this.icon = icon;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.Selectable, false);
+        TabStop = false;
+        Dock = DockStyle.Top;
+        BackColor = Back;
+        Height = BarHeight + 1;
+    }
+
+    float Scale_ => DeviceDpi / 96f;
+    int Px(double v) => (int)Math.Round(v * Scale_);
+    public int BarHeight => Px(38);
+
+    protected override void OnDpiChangedAfterParent(EventArgs e) { base.OnDpiChangedAfterParent(e); Height = BarHeight + 1; Invalidate(); }
+
+    Rectangle ButtonRect(int i) { int w = Px(46); return new Rectangle(Width - w * (2 - i), 0, w, BarHeight); }
+    int HitButton(Point p) => ButtonRect(1).Contains(p) ? 1 : ButtonRect(0).Contains(p) ? 0 : -1;
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        using (var bg = new SolidBrush(Back)) g.FillRectangle(bg, ClientRectangle);
+        if (hot >= 0) using (var b = new SolidBrush(hot == 1 ? CloseHover : Hover)) g.FillRectangle(b, ButtonRect(hot));
+        using (var line = new SolidBrush(Line)) g.FillRectangle(line, 0, BarHeight, Width, Height - BarHeight);
+
+        int x = Px(12);
+        if (icon != null)
+        {
+            int s = Px(18);
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            g.DrawImage(icon, new Rectangle(x, (BarHeight - s) / 2, s, s));
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Default;
+            x += s + Px(9);
+        }
+        using (var font = new Font("Segoe UI Semibold", 12.5f * Scale_, FontStyle.Regular, GraphicsUnit.Pixel))
+            TextRenderer.DrawText(g, Text, font, new Rectangle(x, 0, Math.Max(0, ButtonRect(0).Left - x), BarHeight), Fore,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+
+        // glyphs: 10x10 (at 96 dpi), 1 px strokes, centred in each button
+        using var pen = new Pen(Fore, Math.Max(1f, Scale_));
+        int gs = Px(10), gy = (BarHeight - gs) / 2;
+        var m = ButtonRect(0);
+        int mx = m.Left + (m.Width - gs) / 2, my = gy + Px(5);
+        g.DrawLine(pen, mx, my, mx + gs, my);
+        var c = ButtonRect(1);
+        int cx = c.Left + (c.Width - gs) / 2;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.DrawLine(pen, cx, gy, cx + gs, gy + gs);
+        g.DrawLine(pen, cx + gs, gy, cx, gy + gs);
+    }
+
+    void SetHot(int h)
+    {
+        if (h == hot) return;
+        hot = h;
+        tip.SetToolTip(this, h == 0 ? "Minimize" : h == 1 ? CloseTip : null);
+        Invalidate();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); SetHot(HitButton(e.Location)); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); SetHot(-1); }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        pressed = HitButton(e.Location);
+        if (pressed < 0 && FindForm() is { } f)
+        {
+            ReleaseCapture();
+            SendMessage(f.Handle, WM_NCLBUTTONDOWN, HTCAPTION, IntPtr.Zero);
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        int p = pressed;
+        pressed = -1;
+        if (e.Button != MouseButtons.Left || p < 0 || HitButton(e.Location) != p || FindForm() is not { } f) return;
+        if (p == 0) f.WindowState = FormWindowState.Minimized; else f.Close();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { icon?.Dispose(); tip.Dispose(); }
+        base.Dispose(disposing);
+    }
+}
+
+// PAX dark theme colours and helpers for the stock WinForms controls.
+static class PaxTheme
+{
+    public static readonly Color Back = Hex("#0E1015"), Text = Hex("#E8EAF0"), Muted = Hex("#8A92A6"),
+        Surface = Hex("#161922"), Border = Hex("#272C39"), Raised = Hex("#1D212C"), RaisedHover = Hex("#252A37"),
+        HoverBorder = Hex("#2B7C9A"), Accent = Hex("#19F58C"), AccentHover = Hex("#5CF9AE"), OnAccent = Hex("#04140C"),
+        Danger = Hex("#F2666A"), DangerHover = Hex("#F58A8D"), OnDanger = Hex("#1C0607"), Tick = Hex("#3A4152");
+
+    static Color Hex(string s) => ColorTranslator.FromHtml(s);
+
+    public static System.Drawing.Drawing2D.GraphicsPath Round(RectangleF r, float radius)
+    {
+        var p = new System.Drawing.Drawing2D.GraphicsPath();
+        float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+        if (d <= 0) { p.AddRectangle(r); return p; }
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+
+    // Raised secondary button (#1D212C, 1 px #272C39 border that turns #2B7C9A on hover).
+    public static void RaisedButton(Button b)
+    {
+        b.FlatStyle = FlatStyle.Flat;
+        b.UseVisualStyleBackColor = false;
+        b.BackColor = Raised;
+        b.ForeColor = Text;
+        b.FlatAppearance.BorderSize = 1;
+        b.FlatAppearance.BorderColor = Border;
+        b.FlatAppearance.MouseOverBackColor = RaisedHover;
+        b.FlatAppearance.MouseDownBackColor = Surface;
+        b.MouseEnter += (_, _) => b.FlatAppearance.BorderColor = HoverBorder;
+        b.MouseLeave += (_, _) => b.FlatAppearance.BorderColor = Border;
+    }
+
+    // Primary button: #19F58C with dark text; turns #F2666A while its text is "Stop" (the clicker is running).
+    public static void PrimaryButton(Button b)
+    {
+        b.FlatStyle = FlatStyle.Flat;
+        b.UseVisualStyleBackColor = false;
+        b.FlatAppearance.BorderSize = 0;
+        b.Font = new Font(b.Font, FontStyle.Bold);
+        void Style()
+        {
+            bool stop = b.Text == "Stop";
+            b.BackColor = stop ? Danger : Accent;
+            b.ForeColor = stop ? OnDanger : OnAccent;
+            b.FlatAppearance.MouseOverBackColor = stop ? DangerHover : AccentHover;
+            b.FlatAppearance.MouseDownBackColor = stop ? Danger : Accent;
+        }
+        Style();
+        b.TextChanged += (_, _) => Style();
+    }
+
+    // Dark NumericUpDown: dark edit, 1 px border, and its spin buttons repainted dark.
+    public static void Numeric(PaxNumericUpDown n)
+    {
+        n.BorderStyle = BorderStyle.FixedSingle;
+        n.BackColor = Surface;
+        n.ForeColor = Text;
+        n.Enter += (_, _) => n.Invalidate();
+        n.Leave += (_, _) => n.Invalidate();
+        var spin = n.Controls.Cast<Control>().FirstOrDefault(c => c is not TextBox);
+        if (spin == null) return;
+        int hot = -1; bool pressed = false;
+        spin.MouseMove += (_, e) => { int h = e.Y < spin.Height / 2 ? 0 : 1; if (h != hot) { hot = h; spin.Invalidate(); } };
+        spin.MouseLeave += (_, _) => { hot = -1; pressed = false; spin.Invalidate(); };
+        spin.MouseDown += (_, _) => { pressed = true; spin.Invalidate(); };
+        spin.MouseUp += (_, _) => { pressed = false; spin.Invalidate(); };
+        spin.Paint += (_, e) =>
+        {
+            var g = e.Graphics;
+            float s = spin.DeviceDpi / 96f;
+            int w = spin.Width, h = spin.Height, half = h / 2;
+            using (var bg = new SolidBrush(Raised)) g.FillRectangle(bg, 0, 0, w, h);
+            if (hot >= 0)
+                using (var b = new SolidBrush(pressed ? Surface : RaisedHover))
+                    g.FillRectangle(b, 0, hot == 0 ? 0 : half, w, hot == 0 ? half : h - half);
+            using (var line = new Pen(Border)) { g.DrawLine(line, 0, 0, 0, h); g.DrawLine(line, 0, half, w, half); }
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float cx = w / 2f + 0.5f, a = 3.2f * s;
+            for (int i = 0; i < 2; i++)
+            {
+                float cy = i == 0 ? half / 2f + 0.5f : half + (h - half) / 2f;
+                var pts = i == 0
+                    ? new[] { new PointF(cx - a, cy + a / 2), new PointF(cx + a, cy + a / 2), new PointF(cx, cy - a / 2) }
+                    : new[] { new PointF(cx - a, cy - a / 2), new PointF(cx + a, cy - a / 2), new PointF(cx, cy + a / 2) };
+                using var b = new SolidBrush(hot == i ? Text : Muted);
+                g.FillPolygon(b, pts);
+            }
+        };
+    }
+}
+
+// NumericUpDown with a 1 px #272C39 border (#2B7C9A while focused) and a little room before the number.
+sealed class PaxNumericUpDown : NumericUpDown
+{
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    const int EM_SETMARGINS = 0xD3, EC_LEFTMARGIN = 1;
+
+    public PaxNumericUpDown() { PaxTheme.Numeric(this); }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        foreach (Control c in Controls)
+            if (c is TextBox t)
+            {
+                void Margin() => SendMessage(t.Handle, EM_SETMARGINS, EC_LEFTMARGIN, (IntPtr)(int)Math.Round(3 * DeviceDpi / 96f));
+                if (t.IsHandleCreated) Margin(); else t.HandleCreated += (_, _) => Margin();
+            }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        using var pen = new Pen(ContainsFocus ? PaxTheme.HoverBorder : PaxTheme.Border);
+        e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+    }
+}
+
+// Check box drawn in the PAX look: dark box with a #272C39 border, #19F58C fill and dark tick when checked.
+sealed class PaxCheckBox : CheckBox
+{
+    bool hover;
+
+    public PaxCheckBox()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        AutoSize = true;
+    }
+
+    float Scale_ => DeviceDpi / 96f;
+    int BoxSize => (int)Math.Round(14 * Scale_);
+    int Gap => (int)Math.Round(6 * Scale_);
+
+    public override Size GetPreferredSize(Size proposed)
+    {
+        var text = TextRenderer.MeasureText(Text, Font, Size.Empty, TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        return new Size(BoxSize + Gap + text.Width + 2, Math.Max(base.GetPreferredSize(proposed).Height, BoxSize + 2));
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        float s = Scale_;
+        using (var bg = new SolidBrush(BackColor)) g.FillRectangle(bg, ClientRectangle);
+        int box = BoxSize;
+        var r = new RectangleF(0.5f, (Height - box) / 2 + 0.5f, box - 1, box - 1);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using (var path = PaxTheme.Round(r, 3 * s))
+        {
+            using var fill = new SolidBrush(Checked ? (hover ? PaxTheme.AccentHover : PaxTheme.Accent) : PaxTheme.Surface);
+            g.FillPath(fill, path);
+            if (!Checked || (Focused && ShowFocusCues))
+            {
+                using var pen = new Pen(hover || (Focused && ShowFocusCues) ? PaxTheme.HoverBorder : PaxTheme.Border);
+                g.DrawPath(pen, path);
+            }
+        }
+        if (Checked)
+        {
+            using var tick = new Pen(PaxTheme.OnAccent, 2 * s) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round };
+            g.DrawLines(tick, new[] { new PointF(r.X + 3.3f * s, r.Y + 6.8f * s), new PointF(r.X + 5.8f * s, r.Y + 9.3f * s), new PointF(r.X + 10.2f * s, r.Y + 4.2f * s) });
+        }
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(box + Gap, 0, Math.Max(0, Width - box - Gap), Height), Enabled ? ForeColor : PaxTheme.Muted,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+    }
+}
+
+// Drop-down list drawn dark: the closed box is painted here (also for WM_PRINT), the list items are owner-drawn.
+sealed class PaxComboBox : ComboBox
+{
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PAINTSTRUCT { public IntPtr hdc; public int fErase; public RECT rcPaint; public int fRestore, fIncUpdate; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] reserved; }
+    [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr h, out PAINTSTRUCT ps);
+    [DllImport("user32.dll")] static extern bool EndPaint(IntPtr h, ref PAINTSTRUCT ps);
+    const int WM_PAINT = 0x000F, WM_PRINT = 0x0317, WM_PRINTCLIENT = 0x0318;
+    bool hover;
+
+    public PaxComboBox()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList;
+        DrawMode = DrawMode.OwnerDrawFixed;
+        FlatStyle = FlatStyle.Flat;
+        BackColor = PaxTheme.Surface;
+        ForeColor = PaxTheme.Text;
+    }
+
+    protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); ItemHeight = Font.Height + 2; } // same height as the stock control
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hover = true; Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover = false; Invalidate(); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    protected override void OnDropDownClosed(EventArgs e) { base.OnDropDownClosed(e); Invalidate(); }
+
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        bool sel = (e.State & DrawItemState.Selected) != 0;
+        using (var b = new SolidBrush(sel ? PaxTheme.Raised : PaxTheme.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
+        if (sel) using (var a = new SolidBrush(PaxTheme.Accent)) e.Graphics.FillRectangle(a, e.Bounds.X, e.Bounds.Y, Math.Max(2, (int)Math.Round(2 * DeviceDpi / 96f)), e.Bounds.Height);
+        var r = e.Bounds; r.X += (int)Math.Round(6 * DeviceDpi / 96f);
+        TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font, r, sel ? PaxTheme.Text : PaxTheme.Muted,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+    }
+
+    void PaintBox(Graphics g)
+    {
+        float s = DeviceDpi / 96f;
+        using (var bg = new SolidBrush(PaxTheme.Surface)) g.FillRectangle(bg, 0, 0, Width, Height);
+        using (var pen = new Pen(hover || Focused || DroppedDown ? PaxTheme.HoverBorder : PaxTheme.Border)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        int arrowW = (int)Math.Round(20 * s);
+        TextRenderer.DrawText(g, Text, Font, new Rectangle((int)Math.Round(5 * s), 0, Math.Max(0, Width - arrowW - (int)(5 * s)), Height), ForeColor,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        float cx = Width - arrowW / 2f, cy = Height / 2f, a = 4 * s;
+        using var chevron = new Pen(PaxTheme.Muted, 1.3f * s);
+        g.DrawLines(chevron, new[] { new PointF(cx - a, cy - a / 2), new PointF(cx, cy + a / 2), new PointF(cx + a, cy - a / 2) });
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_PAINT)
+        {
+            var hdc = BeginPaint(Handle, out var ps);
+            using (var g = Graphics.FromHdc(hdc)) PaintBox(g);
+            EndPaint(Handle, ref ps);
+            m.Result = IntPtr.Zero;
+            return;
+        }
+        if (m.Msg is WM_PRINT or WM_PRINTCLIENT && m.WParam != IntPtr.Zero)
+        {
+            using (var g = Graphics.FromHdc(m.WParam)) PaintBox(g);
+            m.Result = IntPtr.Zero;
+            return;
+        }
+        base.WndProc(ref m);
+    }
+}
+
+// Track bar custom-drawn (NM_CUSTOMDRAW): #272C39 track filled #19F58C up to the thumb, a #19F58C thumb, muted ticks.
+sealed class PaxTrackBar : TrackBar
+{
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct NMHDR { public IntPtr hwndFrom; public IntPtr idFrom; public int code; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct NMCUSTOMDRAW { public NMHDR hdr; public int dwDrawStage; public IntPtr hdc; public RECT rc; public IntPtr dwItemSpec; public uint uItemState; public IntPtr lItemlParam; }
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, ref RECT r);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+    const int WM_REFLECT_NOTIFY = 0x204E, NM_CUSTOMDRAW = -12, CDDS_PREPAINT = 1, CDDS_ITEMPREPAINT = 0x10001;
+    const int CDRF_NOTIFYITEMDRAW = 0x20, CDRF_SKIPDEFAULT = 4, TBCD_TICS = 1, TBCD_THUMB = 2, TBCD_CHANNEL = 3;
+    const int TBM_GETTICPOS = 0x40F, TBM_GETNUMTICS = 0x410, TBM_GETTHUMBRECT = 0x419, TBM_GETCHANNELRECT = 0x41A;
+    const uint CDIS_SELECTED = 1, CDIS_HOT = 0x40;
+
+    public PaxTrackBar() { BackColor = PaxTheme.Back; }
+
+    Rectangle GetRect(int msg) { var r = new RECT(); SendMessage(Handle, msg, IntPtr.Zero, ref r); return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom); }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_REFLECT_NOTIFY && Marshal.PtrToStructure<NMHDR>(m.LParam).code == NM_CUSTOMDRAW)
+        {
+            var cd = Marshal.PtrToStructure<NMCUSTOMDRAW>(m.LParam);
+            if (cd.dwDrawStage == CDDS_PREPAINT) { m.Result = CDRF_NOTIFYITEMDRAW; return; }
+            if (cd.dwDrawStage == CDDS_ITEMPREPAINT)
+            {
+                using var g = Graphics.FromHdc(cd.hdc);
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                float s = DeviceDpi / 96f;
+                switch ((int)cd.dwItemSpec)
+                {
+                    case TBCD_CHANNEL:
+                    {
+                        var ch = GetRect(TBM_GETCHANNELRECT);
+                        var th = GetRect(TBM_GETTHUMBRECT);
+                        float h = 4 * s, y = (th.Top + th.Bottom) / 2f - h / 2;
+                        var track = new RectangleF(ch.Left, y, ch.Width, h);
+                        using (var p = PaxTheme.Round(track, h / 2)) using (var b = new SolidBrush(PaxTheme.Border)) g.FillPath(b, p);
+                        var done = new RectangleF(ch.Left, y, Math.Max(h, (th.Left + th.Right) / 2f - ch.Left), h);
+                        using (var p = PaxTheme.Round(done, h / 2)) using (var b = new SolidBrush(PaxTheme.Accent)) g.FillPath(b, p);
+                        break;
+                    }
+                    case TBCD_THUMB:
+                    {
+                        var th = GetRect(TBM_GETTHUMBRECT);
+                        var r = new RectangleF(th.Left + 0.5f, th.Top + 1.5f * s, th.Width - 1, th.Height - 3 * s);
+                        bool hot = (cd.uItemState & (CDIS_HOT | CDIS_SELECTED)) != 0;
+                        using var p = PaxTheme.Round(r, Math.Min(r.Width, r.Height) / 2);
+                        using (var b = new SolidBrush(hot ? PaxTheme.AccentHover : PaxTheme.Accent)) g.FillPath(b, p);
+                        using (var pen = new Pen(PaxTheme.OnAccent)) g.DrawPath(pen, p);
+                        break;
+                    }
+                    case TBCD_TICS:
+                    {
+                        if (TickStyle == TickStyle.None) break;
+                        var th = GetRect(TBM_GETTHUMBRECT);
+                        int n = (int)SendMessage(Handle, TBM_GETNUMTICS, IntPtr.Zero, IntPtr.Zero);
+                        var xs = new List<int>();
+                        for (int i = 0; i < n - 2; i++) xs.Add((int)SendMessage(Handle, TBM_GETTICPOS, (IntPtr)i, IntPtr.Zero));
+                        var ch = GetRect(TBM_GETCHANNELRECT);
+                        int half = th.Width / 2;
+                        xs.Add(ch.Left + half); xs.Add(ch.Right - half - 1); // the end ticks aren't returned by TBM_GETTICPOS
+                        int top = th.Bottom + 1, len = Math.Max(2, (int)Math.Round(3 * s));
+                        using var pen = new Pen(PaxTheme.Tick);
+                        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
+                        foreach (var x in xs) g.DrawLine(pen, x, top, x, top + len);
+                        break;
+                    }
+                }
+                m.Result = CDRF_SKIPDEFAULT;
+                return;
+            }
+        }
+        base.WndProc(ref m);
+    }
+}
 
 class ClickerForm : Form
 {
@@ -20,9 +588,17 @@ class ClickerForm : Form
     const int HotkeyId = 1, ShowHotkeyId = 2, WM_HOTKEY = 0x0312, WH_MOUSE_LL = 14, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
     const uint MOD_SHIFT = 0x0004, MOD_NOREPEAT = 0x4000, VK_F12 = 0x7B;
 
-    readonly CheckBox chkHold = new() { AutoSize = true };
-    readonly CheckBox chkAuto = new() { Text = "Start with Windows (minimized to tray)", AutoSize = true };
+    readonly PaxCheckBox chkHold = new();
+    readonly PaxCheckBox chkAuto = new() { Text = "Start with Windows (minimized to tray)" };
+    readonly PaxCheckBox chkTray = new() { Text = "Show tray icon", Checked = true };
     readonly NotifyIcon tray = new() { Icon = AppIcon(SystemInformation.SmallIconSize), Text = "PAX Auto Clicker (Shift+F12 to open)" };
+    readonly Panel body = new() { Dock = DockStyle.Fill };
+    readonly PaxTitleBar bar = new("PAX Auto Clicker", AppIcon(new Size(64, 64)).ToBitmap()) { CloseTip = "Quit" };
+    readonly EventWaitHandle? showRequest;
+    RegisteredWaitHandle? showWait;
+    IDisposable? linkWatch;
+    bool applyingLink;
+    Point? savedPos;
 
     static Icon AppIcon(Size size)
     {
@@ -31,11 +607,11 @@ class ClickerForm : Form
     }
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", AppKey = @"Software\PaxAutoClicker", RunName = "PaxAutoClicker";
     const string LegacyAppKey = @"Software\AutoClicker", LegacyRunName = "AutoClicker"; // names before the PAX rename
-    readonly CheckBox chkRing = new() { Text = "Show circle at each click", AutoSize = true, Checked = true };
+    readonly PaxCheckBox chkRing = new() { Text = "Show circle at each click", Checked = true };
     readonly ClickRing ring = new();
     volatile bool ringOn = true;
     // The ring overlay can't draw over exclusive-fullscreen games, so clicks can also be heard as a soft tick.
-    readonly CheckBox chkTick = new() { Text = "Tick sound at each click (works over fullscreen games)", AutoSize = true };
+    readonly PaxCheckBox chkTick = new() { Text = "Tick sound at each click (works over fullscreen games)" };
     volatile bool tickOn;
     long lastTickMs;
     readonly System.Diagnostics.Stopwatch tickClock = System.Diagnostics.Stopwatch.StartNew();
@@ -58,35 +634,44 @@ class ClickerForm : Form
     readonly Button btnToggleKey = new() { Width = 110 };
     readonly Button btnModKey = new() { Width = 110 };
 
-    readonly NumericUpDown nCps = new() { Minimum = 1, Maximum = 500, Value = 20, Width = 70 };
-    readonly NumericUpDown nCount = new() { Minimum = 0, Maximum = 10_000_000, Value = 0, Width = 90 };
-    readonly NumericUpDown nStartDelay = new() { Minimum = 0, Maximum = 60, Value = 3, Width = 50 };
-    readonly ComboBox cbButton = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
-    readonly TrackBar tbVolume = new() { Minimum = 0, Maximum = 100, Value = 70, TickFrequency = 10, Width = 120, AutoSize = false, Height = 28 };
-    readonly Label lblVolume = new() { AutoSize = true, ForeColor = Color.Gray };
+    readonly PaxNumericUpDown nCps = new() { Minimum = 1, Maximum = 500, Value = 20, Width = 70 };
+    readonly PaxNumericUpDown nCount = new() { Minimum = 0, Maximum = 10_000_000, Value = 0, Width = 90 };
+    readonly PaxNumericUpDown nStartDelay = new() { Minimum = 0, Maximum = 60, Value = 3, Width = 50 };
+    readonly PaxComboBox cbButton = new() { Width = 90 };
+    readonly PaxTrackBar tbVolume = new() { Minimum = 0, Maximum = 100, Value = 70, TickFrequency = 10, Width = 120, AutoSize = false, Height = 28 };
+    readonly Label lblVolume = new() { AutoSize = true, ForeColor = PaxTheme.Muted };
     readonly Button btn = new() { Text = "Start", Width = 120, Height = 36 };
     readonly Label status = new() { AutoSize = true, Text = "Stopped" };
     CancellationTokenSource? cts;
     long clicks;
 
-    public ClickerForm()
+    public ClickerForm(EventWaitHandle? showRequest = null)
     {
+        this.showRequest = showRequest;
         Text = "PAX Auto Clicker";
         Icon = AppIcon(new Size(32, 32));
         ClientSize = new Size(380, 250);
-        FormBorderStyle = FormBorderStyle.FixedSingle;
+        FormBorderStyle = FormBorderStyle.None; // the PAX title bar replaces the system one
         MaximizeBox = false;
         Font = new Font("Segoe UI", 9);
         TopMost = true;
+        Controls.Add(body);
+        Controls.Add(bar); // added last so it docks first, above the body
+        // PAX dark theme: labels and check boxes take the body's colours; the inputs are styled below
+        BackColor = PaxTheme.Back;
+        body.BackColor = PaxTheme.Back;
+        body.ForeColor = PaxTheme.Text;
+        foreach (var b in new[] { btnToggleKey, btnHoldKey, btnModKey }) PaxTheme.RaisedButton(b);
+        PaxTheme.PrimaryButton(btn);
 
         cbButton.Items.AddRange(new object[] { "Left", "Right", "Middle" }); cbButton.SelectedIndex = 0;
 
         int y = 14;
         void Row(string label, Control c, string? hint = null)
         {
-            Controls.Add(new Label { Text = label, Left = 14, Top = y + 4, AutoSize = true });
-            c.Left = 170; c.Top = y; Controls.Add(c);
-            if (hint != null) Controls.Add(new Label { Text = hint, Left = c.Right + 6, Top = y + 4, AutoSize = true, ForeColor = Color.Gray });
+            body.Controls.Add(new Label { Text = label, Left = 14, Top = y + 4, AutoSize = true });
+            c.Left = 170; c.Top = y; body.Controls.Add(c);
+            if (hint != null) body.Controls.Add(new Label { Text = hint, Left = c.Right + 6, Top = y + 4, AutoSize = true, ForeColor = PaxTheme.Muted });
             y += 32;
         }
         Row("Clicks per second", nCps);
@@ -97,9 +682,9 @@ class ClickerForm : Form
         Row("Hold mode on/off key", btnHoldKey, "click to change");
         Row("Hold with left click", btnModKey, "click to change");
         Row("Sound volume", tbVolume);
-        lblVolume.Left = tbVolume.Right + 6; lblVolume.Top = tbVolume.Top + 4; Controls.Add(lblVolume);
+        lblVolume.Left = tbVolume.Right + 6; lblVolume.Top = tbVolume.Top + 4; body.Controls.Add(lblVolume);
 
-        chkHold.Left = 14; chkHold.Top = y; Controls.Add(chkHold);
+        chkHold.Left = 14; chkHold.Top = y; body.Controls.Add(chkHold);
         chkHold.CheckedChanged += (_, _) =>
         {
             if (chkHold.Checked) StartHoldMode(); else StopHoldMode();
@@ -107,17 +692,24 @@ class ClickerForm : Form
             if (muteNextToggle) muteNextToggle = false; else PlayToggleSound(chkHold.Checked);
         };
         y += 24;
-        chkRing.Left = 14; chkRing.Top = y; Controls.Add(chkRing);
+        chkRing.Left = 14; chkRing.Top = y; body.Controls.Add(chkRing);
         chkRing.CheckedChanged += (_, _) => ringOn = chkRing.Checked;
         y += 24;
-        chkTick.Left = 14; chkTick.Top = y; Controls.Add(chkTick);
+        chkTick.Left = 14; chkTick.Top = y; body.Controls.Add(chkTick);
         chkTick.CheckedChanged += (_, _) => tickOn = chkTick.Checked;
         y += 24;
-        chkAuto.Left = 14; chkAuto.Top = y; Controls.Add(chkAuto);
+        chkAuto.Left = 14; chkAuto.Top = y; body.Controls.Add(chkAuto);
+        y += 24;
+        chkTray.Left = 14; chkTray.Top = y; body.Controls.Add(chkTray);
         y += 28;
-        ClientSize = new Size(380, y + 60);
+        ClientSize = new Size(380, bar.Height + y + 60);
 
         LoadSettings();
+        if (savedPos is { } pos && PaxPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
+        {
+            StartPosition = FormStartPosition.Manual;
+            Location = pos;
+        }
         UpdateKeyTexts();
         SetVolume(tbVolume.Value);
         tbVolume.ValueChanged += (_, _) => SetVolume(tbVolume.Value);
@@ -130,13 +722,26 @@ class ClickerForm : Form
         chkAuto.CheckedChanged += (_, _) => SetAutostart(chkAuto.Checked);
         autostartLaunch = Environment.GetCommandLineArgs().Contains("--autostart");
 
-        // tray: minimizing hides the window; double-click, menu or Shift+F12 restores it
-        tray.Visible = true;
+        // tray: minimizing hides the window; double-click, menu or Shift+F12 restores it.
+        // PAX Toolkit (toolkit.json) and the "Show tray icon" box both decide whether the icon shows.
+        ApplyTrayLink(PaxLink.TrayIconVisible(App.Id));
+        chkTray.CheckedChanged += (_, _) =>
+        {
+            if (applyingLink) return;
+            tray.Visible = chkTray.Checked;
+            PaxLink.SetTrayIconVisible(App.Id, chkTray.Checked);
+        };
+        linkWatch = PaxLink.Watch(() =>
+        {
+            bool on = PaxLink.TrayIconVisible(App.Id);
+            try { if (IsHandleCreated && !IsDisposed) BeginInvoke(() => ApplyTrayLink(on)); } catch (InvalidOperationException) { }
+        });
         tray.ContextMenuStrip = new ContextMenuStrip();
         tray.ContextMenuStrip.Items.Add("Show", null, (_, _) => RestoreFromTray());
         tray.ContextMenuStrip.Items.Add("Exit", null, (_, _) => { tray.Visible = false; Close(); });
         tray.DoubleClick += (_, _) => RestoreFromTray();
-        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) Hide(); };
+        // without a tray icon, minimizing keeps the window on the taskbar instead of hiding it
+        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && tray.Visible) Hide(); };
         Shown += (_, _) =>
         {
             if (autostartLaunch) { muteNextToggle = true; chkHold.Checked = true; WindowState = FormWindowState.Minimized; Hide(); }
@@ -144,14 +749,40 @@ class ClickerForm : Form
 
         btn.Left = 14; btn.Top = y + 6; btn.Click += (_, _) => Toggle();
         status.Left = 150; status.Top = y + 15;
-        Controls.Add(btn); Controls.Add(status);
+        body.Controls.Add(btn); body.Controls.Add(status);
 
         HandleCreated += (_, _) =>
         {
             RegisterKey();
             if (!RegisterHotKey(Handle, ShowHotkeyId, MOD_SHIFT | MOD_NOREPEAT, VK_F12)) status.Text = "Shift+F12 is taken by another app";
+            // another launch of the exe asks this copy to show its window
+            if (showRequest != null && showWait == null)
+                showWait = ThreadPool.RegisterWaitForSingleObject(showRequest, (_, _) =>
+                {
+                    try { if (IsHandleCreated && !IsDisposed) BeginInvoke(RestoreFromTray); } catch (InvalidOperationException) { }
+                }, null, Timeout.Infinite, false);
         };
-        FormClosing += (_, _) => { if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId); };
+        FormClosing += (_, _) => { showWait?.Unregister(null); linkWatch?.Dispose(); if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId); };
+    }
+
+    // borderless, but keeps a drop shadow and the taskbar minimize/restore behaviour
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ClassStyle |= 0x20000;          // CS_DROPSHADOW
+            cp.Style |= 0x20000 | 0x80000;     // WS_MINIMIZEBOX | WS_SYSMENU
+            return cp;
+        }
+    }
+
+    void ApplyTrayLink(bool on)
+    {
+        applyingLink = true;
+        chkTray.Checked = on;
+        applyingLink = false;
+        tray.Visible = on;
     }
 
     void RestoreFromTray() { Show(); WindowState = FormWindowState.Normal; Activate(); }
@@ -184,6 +815,7 @@ class ClickerForm : Form
                 tbVolume.Value = Math.Clamp(Convert.ToInt32(k.GetValue("Volume", 70)), 0, 100);
                 chkTick.Checked = tickOn = Convert.ToInt32(k.GetValue("Tick", 0)) != 0;
                 chkRing.Checked = ringOn = Convert.ToInt32(k.GetValue("Ring", 1)) != 0;
+                if (k.GetValue("WindowX") is int wx && k.GetValue("WindowY") is int wy) savedPos = new Point(wx, wy);
             }
             using var r = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, true);
             if (r?.GetValue(LegacyRunName) != null)
@@ -210,6 +842,13 @@ class ClickerForm : Form
             k.SetValue("Volume", tbVolume.Value);
             k.SetValue("Tick", tickOn ? 1 : 0);
             k.SetValue("Ring", ringOn ? 1 : 0);
+            // window position (fixed size); RestoreBounds gives the normal spot while minimized/hidden
+            var pos = WindowState == FormWindowState.Normal ? Location : RestoreBounds.Location;
+            if (IsHandleCreated && PaxPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
+            {
+                k.SetValue("WindowX", pos.X, Microsoft.Win32.RegistryValueKind.DWord);
+                k.SetValue("WindowY", pos.Y, Microsoft.Win32.RegistryValueKind.DWord);
+            }
         }
         catch { }
     }
