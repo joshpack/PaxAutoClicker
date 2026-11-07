@@ -1,0 +1,29 @@
+# Build output
+bin/
+obj/
+publish/
+dist/
+artifacts/
+*.exe
+*.zip
+
+# Local shortcuts (they hold this PC's paths)
+*.lnk
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# Secrets and local files
+.env
+*.env
+.env.*
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+*.log
+CLAUDE.md
