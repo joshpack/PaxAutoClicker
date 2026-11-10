@@ -40,11 +40,13 @@ It uses Windows-only APIs (low-level keyboard and mouse hooks, `SendInput`, glob
 ## Install
 
 1. Install the **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (x64) if you don't have it.
-2. Download `pxdAutoClicker-1.3.0-win-x64.zip` from **[the latest release](https://github.com/joshpack/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.0-win-x64.zip` and compare the result with the `.sha256` file next to it.
-3. Unzip it somewhere permanent. It contains one folder, `pxdAutoClicker`. To update, quit the app and replace that folder; your settings are kept.
+2. Download `pxdAutoClicker-1.3.1-win-x64.zip` from **[the latest release](https://github.com/joshpack/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.1-win-x64.zip` and compare the result with the `.sha256` file next to it.
+3. Unzip it somewhere permanent. It contains one folder, `pxdAutoClicker`. Your settings live elsewhere and are kept when it updates.
 4. Run `pxdAutoClicker.exe`.
 
 The exe isn't code-signed, so SmartScreen may warn the first time: choose **More info → Run anyway**.
+
+**Updates:** each time it starts, it checks the latest release on GitHub first (for at most 4 seconds). If there's a newer one, it downloads it, checks its `.sha256`, replaces its own files and starts again with the same options. Offline or when GitHub is slow, it just opens. `--no-update` or the environment variable `PXD_NO_UPDATE=1` turns this off.
 
 **Games running as administrator:** Windows doesn't let a normal program send clicks or read keys in a program running as administrator. If a game runs elevated, run pxd Auto Clicker as administrator too.
 
@@ -64,7 +66,8 @@ If another program already uses the start/stop key or Shift + F12, the status li
 | Option | What it does |
 | --- | --- |
 | `--autostart` | Starts hidden in the tray with hold mode on and no chime. "Start with Windows" uses this. |
-| `--self-test` | Checks the one-time move from the app's earlier name (in a scratch registry key and a temp folder; no window, real settings untouched). Prints PASS/FAIL lines; the exit code is the number of failures. |
+| `--no-update` | Opens without checking for a newer release first. |
+| `--self-test` | Checks the one-time move from the app's earlier name (in a scratch registry key and a temp folder) and updating (against a fake release on a local server, in a temp folder); no window, real settings and install untouched. Prints PASS/FAIL lines; the exit code is the number of failures. |
 
 ## Settings
 

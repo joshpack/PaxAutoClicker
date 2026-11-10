@@ -4,12 +4,17 @@ using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 if (args.Contains("--self-test")) return SelfTest.Run();
+// Running an installed copy updates it first, before the single-instance check (a no-op for bin\ builds, offline or
+// slow GitHub, PXD_NO_UPDATE=1); the updated copy restarts with the same arguments.
+if (pxdUpdate.BeforeStart(App.Repo, App.UpdateAsset, args)) return 0;
 App.Run(args);
 return 0;
 
 static class App
 {
     public const string Id = "pxdAutoClicker";
+    public const string Repo = "joshpack/pxdAutoClicker";
+    public const string UpdateAsset = @"^pxdAutoClicker-.*-win-x64\.zip$";
 
     public static void Run(string[] args)
     {
@@ -163,6 +168,195 @@ static class pxdMigrate
             return true;
         }
         catch { return false; }
+    }
+}
+
+// pxd apps update themselves before they open: the same as pxdUpdate in the pxd App Standard (pxdStandard.cs), for
+// this WinForms app. Checks the latest GitHub release (4 s at most), and when it's newer downloads the Windows zip, checks
+// its .sha256, swaps the files in the exe's folder (the old ones are set aside as *.pxdold and removed at the next start)
+// and starts the new exe with the same arguments. Skipped for bin\ / obj\ builds, --self-test, --no-update and
+// PXD_NO_UPDATE=1. PXD_UPDATE_API points it at another server (tests). Never stops the app from opening.
+static class pxdUpdate
+{
+    const string Old = ".pxdold";
+    const string WaitEnv = "PXD_UPDATED_FROM";
+
+    // True when an update was applied and the new copy started: this one should exit at once.
+    public static bool BeforeStart(string repo, string assetPattern, string[] args, Version? current = null)
+    {
+        try
+        {
+            WaitForPrevious();
+            var exe = Environment.ProcessPath;
+            if (exe is null || !OperatingSystem.IsWindows()) return false;
+            var dir = Path.GetDirectoryName(exe)!;
+            CleanUp(dir);
+            // Already running (this start will just hand over to it): never swap files under a running copy.
+            if (OtherCopyRunning(exe)) return false;
+            if (Environment.GetEnvironmentVariable("PXD_NO_UPDATE") == "1"
+                || args.Any(a => a.Equals("--self-test", StringComparison.OrdinalIgnoreCase) || a.Equals("--no-update", StringComparison.OrdinalIgnoreCase))
+                || dir.Contains(@"\bin\", StringComparison.OrdinalIgnoreCase) || dir.Contains(@"\obj\", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            current ??= ThisVersion();
+            var plan = FindUpdateAsync(repo, assetPattern, current).GetAwaiter().GetResult();
+            if (plan is null) return false;
+            return ApplyAsync(plan.Value.Zip, plan.Value.Sum, dir, exe, args).GetAwaiter().GetResult();
+        }
+        catch { return false; }
+    }
+
+    // This copy's version: the informational version without the "+commit" part.
+    public static Version ThisVersion()
+    {
+        var asm = System.Reflection.Assembly.GetEntryAssembly();
+        var info = asm?.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion;
+        return ParseVersion(info) ?? asm?.GetName().Version ?? new Version(0, 0);
+    }
+
+    public static Version? ParseVersion(string? s)
+    {
+        var m = Regex.Match(s ?? "", @"(\d+)\.(\d+)(?:\.(\d+))?");
+        return m.Success ? new Version(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0) : null;
+    }
+
+    // The newer release's zip (and checksum) URLs, or null when this copy is current or GitHub can't be asked.
+    public static async Task<(string Zip, string? Sum)?> FindUpdateAsync(string repo, string assetPattern, Version current)
+    {
+        var api = Environment.GetEnvironmentVariable("PXD_UPDATE_API") is { Length: > 0 } a ? a.TrimEnd('/') : "https://api.github.com";
+        using var http = Client(TimeSpan.FromSeconds(4));
+        using var doc = JsonDocument.Parse(await http.GetStringAsync($"{api}/repos/{repo}/releases/latest"));
+        var root = doc.RootElement;
+        if (ParseVersion(root.GetProperty("tag_name").GetString()) is not { } latest || latest <= current) return null;
+        string? zip = null, sum = null, zipName = null;
+        foreach (var asset in root.GetProperty("assets").EnumerateArray())
+        {
+            var name = asset.GetProperty("name").GetString() ?? "";
+            if (zipName is null && Regex.IsMatch(name, assetPattern))
+            {
+                zipName = name;
+                zip = asset.GetProperty("browser_download_url").GetString();
+            }
+        }
+        if (zip is null) return null;
+        foreach (var asset in root.GetProperty("assets").EnumerateArray())
+            if (asset.GetProperty("name").GetString() == zipName + ".sha256")
+                sum = asset.GetProperty("browser_download_url").GetString();
+        return (zip, sum);
+    }
+
+    // Downloads, checks, swaps the files in dir and starts the new exe. False if anything failed (nothing left half-done).
+    public static async Task<bool> ApplyAsync(string zipUrl, string? sumUrl, string dir, string exe, string[] args, bool start = true)
+    {
+        var stage = Path.Combine(Path.GetTempPath(), "pxd-update-" + Guid.NewGuid().ToString("N"));
+        var moved = new List<string>();
+        var added = new List<string>();
+        try
+        {
+            Directory.CreateDirectory(stage);
+            var zip = Path.Combine(stage, "update.zip");
+            using (var http = Client(TimeSpan.FromMinutes(5)))
+            {
+                await using (var src = await http.GetStreamAsync(zipUrl))
+                await using (var dst = File.Create(zip))
+                    await src.CopyToAsync(dst);
+                if (sumUrl is not null)
+                {
+                    var expected = Regex.Match(await http.GetStringAsync(sumUrl), "[0-9a-fA-F]{64}").Value;
+                    await using var fs = File.OpenRead(zip);
+                    var actual = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(fs));
+                    if (expected.Length == 64 && !expected.Equals(actual, StringComparison.OrdinalIgnoreCase)) return false;
+                }
+            }
+
+            var unz = Path.Combine(stage, "x");
+            System.IO.Compression.ZipFile.ExtractToDirectory(zip, unz);
+            var root = unz;
+            if (Directory.GetFiles(unz).Length == 0 && Directory.GetDirectories(unz) is [var only]) root = only;
+            if (!File.Exists(Path.Combine(root, Path.GetFileName(exe)))) return false; // not this app's download
+
+            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                var dest = Path.Combine(dir, Path.GetRelativePath(root, file));
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                if (File.Exists(dest))
+                {
+                    File.Move(dest, dest + Old, overwrite: true);
+                    moved.Add(dest);
+                }
+                else added.Add(dest);
+                File.Copy(file, dest);
+            }
+
+            if (start)
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = Environment.CurrentDirectory };
+                foreach (var a in args) psi.ArgumentList.Add(a);
+                psi.Environment[WaitEnv] = Environment.ProcessId.ToString();
+                System.Diagnostics.Process.Start(psi)?.Dispose();
+            }
+            return true;
+        }
+        catch
+        {
+            // Put the old files back.
+            foreach (var f in added) try { File.Delete(f); } catch { }
+            foreach (var f in moved) try { File.Move(f + Old, f, overwrite: true); } catch { }
+            return false;
+        }
+        finally
+        {
+            try { Directory.Delete(stage, true); } catch { }
+        }
+    }
+
+    // Removes the files an update set aside (they are free once the old copy has closed).
+    public static void CleanUp(string dir)
+    {
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, "*" + Old, SearchOption.AllDirectories))
+                try { File.Delete(f); } catch { /* still in use: next start */ }
+        }
+        catch { }
+    }
+
+    // Another process started from the same exe file is running.
+    public static bool OtherCopyRunning(string exe)
+    {
+        var found = false;
+        foreach (var p in System.Diagnostics.Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exe)))
+        {
+            using (p)
+            {
+                if (found || p.Id == Environment.ProcessId) continue;
+                try { found = string.Equals(p.MainModule?.FileName, exe, StringComparison.OrdinalIgnoreCase); }
+                catch { found = true; } // can't tell (elevated copy): assume it's ours and leave the files alone
+            }
+        }
+        return found;
+    }
+
+    // A copy started by an update waits for the old one to close, so its single-instance mutex is free.
+    static void WaitForPrevious()
+    {
+        if (!int.TryParse(Environment.GetEnvironmentVariable(WaitEnv), out var pid)) return;
+        Environment.SetEnvironmentVariable(WaitEnv, null);
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            p.WaitForExit(15000);
+        }
+        catch { }
+    }
+
+    static HttpClient Client(TimeSpan timeout)
+    {
+        var http = new HttpClient { Timeout = timeout };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("pxd-update/1.0");
+        http.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        return http;
     }
 }
 
@@ -1531,7 +1725,107 @@ static class SelfTest
             try { Directory.Delete(temp, recursive: true); } catch { }
         }
 
+        UpdateChecks(Check);
+
         Console.WriteLine(failed == 0 ? "All self-tests passed." : $"{failed} self-test(s) failed.");
         return failed;
+    }
+
+    // Update before start, against a fake release on a local listener and a temp "install" folder; nothing real is updated.
+    static void UpdateChecks(Action<bool, string> Check)
+    {
+        var root = Path.Combine(Path.GetTempPath(), App.Id + ".UpdateTest-" + Guid.NewGuid().ToString("N"));
+        System.Net.HttpListener? listener = null;
+        Task? serving = null;
+        try
+        {
+            // Pointed at a port nothing listens on first, so even a slip could never reach GitHub.
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", "http://127.0.0.1:1");
+            Check(!pxdUpdate.BeforeStart(App.Repo, App.UpdateAsset, ["--self-test"]), "update: --self-test never updates");
+            Check(!pxdUpdate.BeforeStart(App.Repo, App.UpdateAsset, []), "update: a bin\\ build (or no server) never updates");
+
+            // Another copy of the same exe running: never update under it. A windowless system exe stands in for it.
+            Check(!pxdUpdate.OtherCopyRunning(Environment.ProcessPath!), "update: only this copy running: free to update");
+            var ping = Path.Combine(Environment.SystemDirectory, "PING.EXE");
+            using (var other = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(ping, "-n 6 127.0.0.1")
+                   { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!)
+            {
+                Thread.Sleep(300);
+                Check(pxdUpdate.OtherCopyRunning(ping), "update: another copy running: files left alone");
+                try { other.Kill(); } catch { }
+            }
+            Check(!pxdUpdate.OtherCopyRunning(Path.Combine(Path.GetTempPath(), "pxd-not-running-" + Guid.NewGuid().ToString("N") + ".exe")), "update: a name nothing runs under");
+
+            string app = Path.Combine(root, "app"), pkg = Path.Combine(root, "pkg", App.Id);
+            Directory.CreateDirectory(app);
+            Directory.CreateDirectory(pkg);
+            string exe = Path.Combine(app, App.Id + ".exe");
+            File.WriteAllText(exe, "old exe");
+            File.WriteAllText(Path.Combine(app, App.Id + ".dll"), "old dll");
+            File.WriteAllText(Path.Combine(pkg, App.Id + ".exe"), "new exe");
+            File.WriteAllText(Path.Combine(pkg, App.Id + ".dll"), "new dll");
+            File.WriteAllText(Path.Combine(pkg, "extra.json"), "new file");
+            string asset = App.Id + "-9.0.0-win-x64.zip", zip = Path.Combine(root, asset);
+            System.IO.Compression.ZipFile.CreateFromDirectory(Path.Combine(root, "pkg"), zip);
+            var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(zip))).ToLowerInvariant();
+
+            var prefix = $"http://127.0.0.1:{new Random().Next(41000, 49000)}/";
+            listener = new System.Net.HttpListener();
+            listener.Prefixes.Add(prefix);
+            listener.Start();
+            var badSum = false;
+            var l = listener;
+            serving = Task.Run(async () =>
+            {
+                while (l.IsListening)
+                {
+                    System.Net.HttpListenerContext ctx;
+                    try { ctx = await l.GetContextAsync(); } catch { return; }
+                    var assets = new JsonArray
+                    {
+                        new JsonObject { ["name"] = asset, ["browser_download_url"] = prefix + "zip" },
+                        new JsonObject { ["name"] = asset + ".sha256", ["browser_download_url"] = prefix + "sum" },
+                    };
+                    byte[] body = ctx.Request.Url!.AbsolutePath switch
+                    {
+                        "/repos/" + App.Repo + "/releases/latest" => System.Text.Encoding.UTF8.GetBytes(new JsonObject { ["tag_name"] = "v9.0.0", ["assets"] = assets }.ToJsonString()),
+                        "/zip" => File.ReadAllBytes(zip),
+                        "/sum" => System.Text.Encoding.ASCII.GetBytes((badSum ? new string('0', 64) : hash) + "  " + asset),
+                        _ => [],
+                    };
+                    ctx.Response.StatusCode = body.Length == 0 ? 404 : 200;
+                    await ctx.Response.OutputStream.WriteAsync(body);
+                    ctx.Response.Close();
+                }
+            });
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", prefix.TrimEnd('/'));
+
+            var plan = pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(1, 3, 1)).GetAwaiter().GetResult();
+            Check(plan is { } p && p.Zip == prefix + "zip" && p.Sum == prefix + "sum", "update: newer release found, with its checksum");
+            Check(pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(9, 0, 0)).GetAwaiter().GetResult() is null, "update: current copy left alone");
+
+            badSum = true;
+            var refused = !pxdUpdate.ApplyAsync(plan!.Value.Zip, plan.Value.Sum, app, exe, ["--autostart"], start: false).GetAwaiter().GetResult();
+            Check(refused && File.ReadAllText(exe) == "old exe" && !File.Exists(Path.Combine(app, "extra.json")), "update: a bad checksum changes nothing");
+
+            badSum = false;
+            var ok = pxdUpdate.ApplyAsync(plan.Value.Zip, plan.Value.Sum, app, exe, ["--autostart"], start: false).GetAwaiter().GetResult();
+            Check(ok && File.ReadAllText(exe) == "new exe" && File.ReadAllText(Path.Combine(app, App.Id + ".dll")) == "new dll" && File.Exists(Path.Combine(app, "extra.json")), "update: files swapped");
+            Check(File.Exists(exe + ".pxdold"), "update: old files set aside as *.pxdold");
+            pxdUpdate.CleanUp(app);
+            Check(Directory.GetFiles(app, "*.pxdold").Length == 0, "update: set-aside files removed at the next start");
+            Check(pxdUpdate.ParseVersion("1.3.1+abc") == new Version(1, 3, 1) && pxdUpdate.ParseVersion("v1.4") == new Version(1, 4, 0), "update: version parse");
+        }
+        catch (Exception ex)
+        {
+            Check(false, "update: unexpected " + ex.GetType().Name + ": " + ex.Message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", null);
+            try { listener?.Stop(); } catch { }
+            try { serving?.Wait(2000); } catch { }
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
     }
 }
