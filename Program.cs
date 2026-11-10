@@ -1,18 +1,23 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
+if (args.Contains("--self-test")) return SelfTest.Run();
 App.Run(args);
+return 0;
 
 static class App
 {
-    public const string Id = "PaxAutoClicker";
+    public const string Id = "pxdAutoClicker";
 
     public static void Run(string[] args)
     {
         // A second launch hands over to the running copy (which shows its window) and exits.
-        using var single = SingleInstance.Claim(@"Local\PaxAutoClicker.Instance", @"Local\PaxAutoClicker.Show", signalIfRunning: !args.Contains("--autostart"));
+        using var single = SingleInstance.Claim(@"Local\pxdAutoClicker.Instance", @"Local\pxdAutoClicker.Show", signalIfRunning: !args.Contains("--autostart"));
         if (single == null) return;
+        // First start after the rename: settings, "Start with Windows" and the Toolkit file move to the new name.
+        pxdMigrate.Run();
         ApplicationConfiguration.Initialize();
         Application.Run(new ClickerForm(single.ShowRequest));
     }
@@ -49,13 +54,125 @@ sealed class SingleInstance : IDisposable
     }
 }
 
-// PAX Toolkit link: %APPDATA%\PAX\toolkit.json -> apps.<id>.trayIcon (default true). PAX_SHARED_DIR overrides the folder.
-static class PaxLink
+// One-time moves from the app's former name (versions before 1.3.0 went by it). Every step is safe to repeat: it does
+// nothing once the new place exists or the old one is gone, and never throws. Only this class names the former places.
+static class pxdMigrate
+{
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+    // The prefix the apps had before the pxd rename.
+    public const string FormerPrefix = "Pax";
+
+    // "pxdAutoClicker" -> the same name under the former prefix.
+    public static string FormerName(string pxdName) =>
+        pxdName.StartsWith("pxd", StringComparison.Ordinal) ? FormerPrefix + pxdName[3..] : pxdName;
+
+    // The former shared folder of the Toolkit link (%APPDATA%\ + the former prefix in capitals).
+    static string FormerSharedDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), FormerPrefix.ToUpperInvariant());
+
+    // At start-up, before anything reads the settings.
+    public static void Run()
+    {
+        RegistryKey(@"Software\" + FormerName(App.Id), @"Software\" + App.Id);
+        if (Environment.ProcessPath is { Length: > 0 } exe)
+            RunEntry(RunKey, ApprovedKey, FormerName(App.Id), App.Id, exe);
+        // PXD_SHARED_DIR set (tests): the real shared file is left alone.
+        if (Environment.GetEnvironmentVariable("PXD_SHARED_DIR") is not { Length: > 0 })
+            SharedFile(Path.Combine(FormerSharedDir, "toolkit.json"), pxdLink.FilePath);
+    }
+
+    // Moves HKCU\<oldPath> (values and subkeys) to HKCU\<newPath> when only the old one exists. True if it moved.
+    public static bool RegistryKey(string oldPath, string newPath)
+    {
+        try
+        {
+            var hkcu = Microsoft.Win32.Registry.CurrentUser;
+            using (var existing = hkcu.OpenSubKey(newPath))
+                if (existing != null) return false;
+            using (var old = hkcu.OpenSubKey(oldPath))
+            {
+                if (old == null) return false;
+                using var created = hkcu.CreateSubKey(newPath);
+                CopyTree(old, created);
+            }
+            hkcu.DeleteSubKeyTree(oldPath, throwOnMissingSubKey: false);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    static void CopyTree(Microsoft.Win32.RegistryKey from, Microsoft.Win32.RegistryKey to)
+    {
+        foreach (var name in from.GetValueNames())
+            to.SetValue(name, from.GetValue(name, null, Microsoft.Win32.RegistryValueOptions.DoNotExpandEnvironmentNames)!, from.GetValueKind(name));
+        foreach (var sub in from.GetSubKeyNames())
+        {
+            using var src = from.OpenSubKey(sub);
+            using var dst = to.CreateSubKey(sub);
+            if (src != null) CopyTree(src, dst);
+        }
+    }
+
+    // If the Run value oldName exists under HKCU\<runKey>, replaces it with newName = "exe" + the old arguments, and
+    // carries over Task Manager's enabled/disabled state (HKCU\<approvedKey>). Never creates one. True if it moved.
+    public static bool RunEntry(string runKey, string approvedKey, string oldName, string newName, string exe)
+    {
+        try
+        {
+            using var run = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(runKey, writable: true);
+            if (run?.GetValue(oldName) is not string old) return false;
+            var args = ArgsOf(old);
+            run.SetValue(newName, $"\"{exe}\"" + (args.Length > 0 ? " " + args : ""));
+            run.DeleteValue(oldName, throwOnMissingValue: false);
+            using var approved = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(approvedKey, writable: true);
+            if (approved?.GetValue(oldName) is byte[] state)
+            {
+                approved.SetValue(newName, state, Microsoft.Win32.RegistryValueKind.Binary);
+                approved.DeleteValue(oldName, throwOnMissingValue: false);
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // The arguments after the program in a Run command line.
+    public static string ArgsOf(string command)
+    {
+        var c = command.Trim();
+        if (c.StartsWith('"'))
+        {
+            var end = c.IndexOf('"', 1);
+            return end < 0 ? "" : c[(end + 1)..].Trim();
+        }
+        var space = c.IndexOf(' ');
+        return space < 0 ? "" : c[(space + 1)..].Trim();
+    }
+
+    // Copies the former toolkit.json to the new one (app ids under the former prefix renamed to pxd…) when the new one
+    // doesn't exist yet. The old file stays for apps that haven't been updated. True if it copied.
+    public static bool SharedFile(string oldFile, string newFile)
+    {
+        try
+        {
+            if (File.Exists(newFile) || !File.Exists(oldFile)) return false;
+            var text = Regex.Replace(File.ReadAllText(oldFile), "\"" + FormerPrefix + "([A-Za-z]+)\"", m => "\"pxd" + m.Groups[1].Value + "\"");
+            Directory.CreateDirectory(Path.GetDirectoryName(newFile)!);
+            File.WriteAllText(newFile, text);
+            return true;
+        }
+        catch { return false; }
+    }
+}
+
+// pxd Toolkit link: %APPDATA%\pxd\toolkit.json -> apps.<id>.trayIcon (default true). PXD_SHARED_DIR overrides the folder.
+static class pxdLink
 {
     public static string SharedDir =>
-        Environment.GetEnvironmentVariable("PAX_SHARED_DIR") is { Length: > 0 } d
+        Environment.GetEnvironmentVariable("PXD_SHARED_DIR") is { Length: > 0 } d
             ? d
-            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PAX");
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "pxd");
 
     public static string FilePath => Path.Combine(SharedDir, "toolkit.json");
 
@@ -121,7 +238,7 @@ static class PaxLink
     }
 }
 
-static class PaxPlacement
+static class pxdPlacement
 {
     // A saved spot counts only if a real part of the title bar lands in some screen's working area.
     public static bool IsVisible(Rectangle window, int barHeight, IEnumerable<Rectangle> workAreas)
@@ -134,9 +251,9 @@ static class PaxPlacement
         IsVisible(window, barHeight, Screen.AllScreens.Select(s => s.WorkingArea));
 }
 
-// The PAX title bar: 38 px #0A0D12 with a 1 px #1B2030 line under it, the app icon (18 px) and name on the left,
+// The pxd title bar: 38 px #0A0D12 with a 1 px #1B2030 line under it, the app icon (18 px) and name on the left,
 // minimize and close (46x38) at the right. Empty bar area drags the window.
-sealed class PaxTitleBar : Control
+sealed class pxdTitleBar : Control
 {
     static readonly Color Back = ColorTranslator.FromHtml("#0A0D12"), Line = ColorTranslator.FromHtml("#1B2030"),
         Fore = ColorTranslator.FromHtml("#C9CED9"), Hover = ColorTranslator.FromHtml("#1F2533"), CloseHover = ColorTranslator.FromHtml("#E81123");
@@ -151,7 +268,7 @@ sealed class PaxTitleBar : Control
     public string CloseTip { get; set; } = "Close";
     public Action? CloseAction; // replaces closing the form when the X is clicked
 
-    public PaxTitleBar(string title, Bitmap? icon)
+    public pxdTitleBar(string title, Bitmap? icon)
     {
         Text = title;
         this.icon = icon;
@@ -245,8 +362,8 @@ sealed class PaxTitleBar : Control
     }
 }
 
-// PAX dark theme colours and helpers for the stock WinForms controls.
-static class PaxTheme
+// pxd dark theme colours and helpers for the stock WinForms controls.
+static class pxdTheme
 {
     public static readonly Color Back = Hex("#0E1015"), Text = Hex("#E8EAF0"), Muted = Hex("#8A92A6"),
         Surface = Hex("#161922"), Border = Hex("#272C39"), Raised = Hex("#1D212C"), RaisedHover = Hex("#252A37"),
@@ -303,7 +420,7 @@ static class PaxTheme
     }
 
     // Dark NumericUpDown: dark edit, 1 px border, and its spin buttons repainted dark.
-    public static void Numeric(PaxNumericUpDown n)
+    public static void Numeric(pxdNumericUpDown n)
     {
         n.BorderStyle = BorderStyle.FixedSingle;
         n.BackColor = Surface;
@@ -343,12 +460,12 @@ static class PaxTheme
 }
 
 // NumericUpDown with a 1 px #272C39 border (#2B7C9A while focused) and a little room before the number.
-sealed class PaxNumericUpDown : NumericUpDown
+sealed class pxdNumericUpDown : NumericUpDown
 {
     [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
     const int EM_SETMARGINS = 0xD3, EC_LEFTMARGIN = 1;
 
-    public PaxNumericUpDown() { PaxTheme.Numeric(this); }
+    public pxdNumericUpDown() { pxdTheme.Numeric(this); }
 
     protected override void OnHandleCreated(EventArgs e)
     {
@@ -364,17 +481,17 @@ sealed class PaxNumericUpDown : NumericUpDown
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        using var pen = new Pen(ContainsFocus ? PaxTheme.HoverBorder : PaxTheme.Border);
+        using var pen = new Pen(ContainsFocus ? pxdTheme.HoverBorder : pxdTheme.Border);
         e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
     }
 }
 
-// Check box drawn in the PAX look: dark box with a #272C39 border, #19F58C fill and dark tick when checked.
-sealed class PaxCheckBox : CheckBox
+// Check box drawn in the pxd look: dark box with a #272C39 border, #19F58C fill and dark tick when checked.
+sealed class pxdCheckBox : CheckBox
 {
     bool hover;
 
-    public PaxCheckBox()
+    public pxdCheckBox()
     {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
         AutoSize = true;
@@ -403,28 +520,28 @@ sealed class PaxCheckBox : CheckBox
         int box = BoxSize;
         var r = new RectangleF(0.5f, (Height - box) / 2 + 0.5f, box - 1, box - 1);
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        using (var path = PaxTheme.Round(r, 3 * s))
+        using (var path = pxdTheme.Round(r, 3 * s))
         {
-            using var fill = new SolidBrush(Checked ? (hover ? PaxTheme.AccentHover : PaxTheme.Accent) : PaxTheme.Surface);
+            using var fill = new SolidBrush(Checked ? (hover ? pxdTheme.AccentHover : pxdTheme.Accent) : pxdTheme.Surface);
             g.FillPath(fill, path);
             if (!Checked || (Focused && ShowFocusCues))
             {
-                using var pen = new Pen(hover || (Focused && ShowFocusCues) ? PaxTheme.HoverBorder : PaxTheme.Border);
+                using var pen = new Pen(hover || (Focused && ShowFocusCues) ? pxdTheme.HoverBorder : pxdTheme.Border);
                 g.DrawPath(pen, path);
             }
         }
         if (Checked)
         {
-            using var tick = new Pen(PaxTheme.OnAccent, 2 * s) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round };
+            using var tick = new Pen(pxdTheme.OnAccent, 2 * s) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round };
             g.DrawLines(tick, new[] { new PointF(r.X + 3.3f * s, r.Y + 6.8f * s), new PointF(r.X + 5.8f * s, r.Y + 9.3f * s), new PointF(r.X + 10.2f * s, r.Y + 4.2f * s) });
         }
-        TextRenderer.DrawText(g, Text, Font, new Rectangle(box + Gap, 0, Math.Max(0, Width - box - Gap), Height), Enabled ? ForeColor : PaxTheme.Muted,
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(box + Gap, 0, Math.Max(0, Width - box - Gap), Height), Enabled ? ForeColor : pxdTheme.Muted,
             TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
     }
 }
 
 // Drop-down list drawn dark: the closed box is painted here (also for WM_PRINT), the list items are owner-drawn.
-sealed class PaxComboBox : ComboBox
+sealed class pxdComboBox : ComboBox
 {
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
@@ -434,13 +551,13 @@ sealed class PaxComboBox : ComboBox
     const int WM_PAINT = 0x000F, WM_PRINT = 0x0317, WM_PRINTCLIENT = 0x0318;
     bool hover;
 
-    public PaxComboBox()
+    public pxdComboBox()
     {
         DropDownStyle = ComboBoxStyle.DropDownList;
         DrawMode = DrawMode.OwnerDrawFixed;
         FlatStyle = FlatStyle.Flat;
-        BackColor = PaxTheme.Surface;
-        ForeColor = PaxTheme.Text;
+        BackColor = pxdTheme.Surface;
+        ForeColor = pxdTheme.Text;
     }
 
     protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); ItemHeight = Font.Height + 2; } // same height as the stock control
@@ -454,24 +571,24 @@ sealed class PaxComboBox : ComboBox
     {
         if (e.Index < 0) return;
         bool sel = (e.State & DrawItemState.Selected) != 0;
-        using (var b = new SolidBrush(sel ? PaxTheme.Raised : PaxTheme.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
-        if (sel) using (var a = new SolidBrush(PaxTheme.Accent)) e.Graphics.FillRectangle(a, e.Bounds.X, e.Bounds.Y, Math.Max(2, (int)Math.Round(2 * DeviceDpi / 96f)), e.Bounds.Height);
+        using (var b = new SolidBrush(sel ? pxdTheme.Raised : pxdTheme.Surface)) e.Graphics.FillRectangle(b, e.Bounds);
+        if (sel) using (var a = new SolidBrush(pxdTheme.Accent)) e.Graphics.FillRectangle(a, e.Bounds.X, e.Bounds.Y, Math.Max(2, (int)Math.Round(2 * DeviceDpi / 96f)), e.Bounds.Height);
         var r = e.Bounds; r.X += (int)Math.Round(6 * DeviceDpi / 96f);
-        TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font, r, sel ? PaxTheme.Text : PaxTheme.Muted,
+        TextRenderer.DrawText(e.Graphics, GetItemText(Items[e.Index]), Font, r, sel ? pxdTheme.Text : pxdTheme.Muted,
             TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
     }
 
     void PaintBox(Graphics g)
     {
         float s = DeviceDpi / 96f;
-        using (var bg = new SolidBrush(PaxTheme.Surface)) g.FillRectangle(bg, 0, 0, Width, Height);
-        using (var pen = new Pen(hover || Focused || DroppedDown ? PaxTheme.HoverBorder : PaxTheme.Border)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        using (var bg = new SolidBrush(pxdTheme.Surface)) g.FillRectangle(bg, 0, 0, Width, Height);
+        using (var pen = new Pen(hover || Focused || DroppedDown ? pxdTheme.HoverBorder : pxdTheme.Border)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
         int arrowW = (int)Math.Round(20 * s);
         TextRenderer.DrawText(g, Text, Font, new Rectangle((int)Math.Round(5 * s), 0, Math.Max(0, Width - arrowW - (int)(5 * s)), Height), ForeColor,
             TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
         float cx = Width - arrowW / 2f, cy = Height / 2f, a = 4 * s;
-        using var chevron = new Pen(PaxTheme.Muted, 1.3f * s);
+        using var chevron = new Pen(pxdTheme.Muted, 1.3f * s);
         g.DrawLines(chevron, new[] { new PointF(cx - a, cy - a / 2), new PointF(cx, cy + a / 2), new PointF(cx + a, cy - a / 2) });
     }
 
@@ -496,7 +613,7 @@ sealed class PaxComboBox : ComboBox
 }
 
 // Track bar custom-drawn (NM_CUSTOMDRAW): #272C39 track filled #19F58C up to the thumb, a #19F58C thumb, muted ticks.
-sealed class PaxTrackBar : TrackBar
+sealed class pxdTrackBar : TrackBar
 {
     [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] struct NMHDR { public IntPtr hwndFrom; public IntPtr idFrom; public int code; }
@@ -509,7 +626,7 @@ sealed class PaxTrackBar : TrackBar
     const int TBM_GETTICPOS = 0x40F, TBM_GETNUMTICS = 0x410, TBM_GETTHUMBRECT = 0x419, TBM_GETCHANNELRECT = 0x41A;
     const uint CDIS_SELECTED = 1, CDIS_HOT = 0x40;
 
-    public PaxTrackBar() { BackColor = PaxTheme.Back; }
+    public pxdTrackBar() { BackColor = pxdTheme.Back; }
 
     Rectangle GetRect(int msg) { var r = new RECT(); SendMessage(Handle, msg, IntPtr.Zero, ref r); return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom); }
 
@@ -532,9 +649,9 @@ sealed class PaxTrackBar : TrackBar
                         var th = GetRect(TBM_GETTHUMBRECT);
                         float h = 4 * s, y = (th.Top + th.Bottom) / 2f - h / 2;
                         var track = new RectangleF(ch.Left, y, ch.Width, h);
-                        using (var p = PaxTheme.Round(track, h / 2)) using (var b = new SolidBrush(PaxTheme.Border)) g.FillPath(b, p);
+                        using (var p = pxdTheme.Round(track, h / 2)) using (var b = new SolidBrush(pxdTheme.Border)) g.FillPath(b, p);
                         var done = new RectangleF(ch.Left, y, Math.Max(h, (th.Left + th.Right) / 2f - ch.Left), h);
-                        using (var p = PaxTheme.Round(done, h / 2)) using (var b = new SolidBrush(PaxTheme.Accent)) g.FillPath(b, p);
+                        using (var p = pxdTheme.Round(done, h / 2)) using (var b = new SolidBrush(pxdTheme.Accent)) g.FillPath(b, p);
                         break;
                     }
                     case TBCD_THUMB:
@@ -542,9 +659,9 @@ sealed class PaxTrackBar : TrackBar
                         var th = GetRect(TBM_GETTHUMBRECT);
                         var r = new RectangleF(th.Left + 0.5f, th.Top + 1.5f * s, th.Width - 1, th.Height - 3 * s);
                         bool hot = (cd.uItemState & (CDIS_HOT | CDIS_SELECTED)) != 0;
-                        using var p = PaxTheme.Round(r, Math.Min(r.Width, r.Height) / 2);
-                        using (var b = new SolidBrush(hot ? PaxTheme.AccentHover : PaxTheme.Accent)) g.FillPath(b, p);
-                        using (var pen = new Pen(PaxTheme.OnAccent)) g.DrawPath(pen, p);
+                        using var p = pxdTheme.Round(r, Math.Min(r.Width, r.Height) / 2);
+                        using (var b = new SolidBrush(hot ? pxdTheme.AccentHover : pxdTheme.Accent)) g.FillPath(b, p);
+                        using (var pen = new Pen(pxdTheme.OnAccent)) g.DrawPath(pen, p);
                         break;
                     }
                     case TBCD_TICS:
@@ -558,7 +675,7 @@ sealed class PaxTrackBar : TrackBar
                         int half = th.Width / 2;
                         xs.Add(ch.Left + half); xs.Add(ch.Right - half - 1); // the end ticks aren't returned by TBM_GETTICPOS
                         int top = th.Bottom + 1, len = Math.Max(2, (int)Math.Round(3 * s));
-                        using var pen = new Pen(PaxTheme.Tick);
+                        using var pen = new Pen(pxdTheme.Tick);
                         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.None;
                         foreach (var x in xs) g.DrawLine(pen, x, top, x, top + len);
                         break;
@@ -589,12 +706,12 @@ class ClickerForm : Form
     const int HotkeyId = 1, ShowHotkeyId = 2, WM_HOTKEY = 0x0312, WH_MOUSE_LL = 14, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
     const uint MOD_SHIFT = 0x0004, MOD_NOREPEAT = 0x4000, VK_F12 = 0x7B;
 
-    readonly PaxCheckBox chkHold = new();
-    readonly PaxCheckBox chkAuto = new() { Text = "Start with Windows (minimized to tray)" };
-    readonly PaxCheckBox chkTray = new() { Text = "Show tray icon", Checked = true };
-    readonly NotifyIcon tray = new() { Icon = AppIcon(SystemInformation.SmallIconSize), Text = "PAX Auto Clicker (Shift+F12 to open)" };
+    readonly pxdCheckBox chkHold = new();
+    readonly pxdCheckBox chkAuto = new() { Text = "Start with Windows (minimized to tray)" };
+    readonly pxdCheckBox chkTray = new() { Text = "Show tray icon", Checked = true };
+    readonly NotifyIcon tray = new() { Icon = AppIcon(SystemInformation.SmallIconSize), Text = "pxd Auto Clicker (Shift+F12 to open)" };
     readonly Panel body = new() { Dock = DockStyle.Fill };
-    readonly PaxTitleBar bar = new("PAX Auto Clicker", AppIcon(new Size(64, 64)).ToBitmap()) { CloseTip = "Hide (use Exit to quit)" };
+    readonly pxdTitleBar bar = new("pxd Auto Clicker", AppIcon(new Size(64, 64)).ToBitmap()) { CloseTip = "Hide (use Exit to quit)" };
     readonly EventWaitHandle? showRequest;
     RegisteredWaitHandle? showWait;
     IDisposable? linkWatch;
@@ -606,18 +723,22 @@ class ClickerForm : Form
         using var s = typeof(ClickerForm).Assembly.GetManifestResourceStream("app.ico");
         return s != null ? new Icon(s, size) : SystemIcons.Application;
     }
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", AppKey = @"Software\PaxAutoClicker", RunName = "PaxAutoClicker";
-    const string LegacyAppKey = @"Software\AutoClicker", LegacyRunName = "AutoClicker"; // names before the PAX rename
-    readonly PaxCheckBox chkRing = new() { Text = "Show circle at each click", Checked = true };
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", AppKey = @"Software\pxdAutoClicker", RunName = "pxdAutoClicker";
+    const string LegacyAppKey = @"Software\AutoClicker", LegacyRunName = "AutoClicker"; // the plain names it had before its first rename (1.0.0)
+    readonly pxdCheckBox chkRing = new() { Text = "Show circle at each click", Checked = true };
     readonly ClickRing ring = new();
     volatile bool ringOn = true;
     // The ring overlay can't draw over exclusive-fullscreen games, so clicks can also be heard as a soft tick.
-    readonly PaxCheckBox chkTick = new() { Text = "Tick sound at each click (works over fullscreen games)" };
+    readonly pxdCheckBox chkTick = new() { Text = "Tick sound at each click (works over fullscreen games)" };
     volatile bool tickOn;
     long lastTickMs;
     readonly System.Diagnostics.Stopwatch tickClock = System.Diagnostics.Stopwatch.StartNew();
+    // A dot beside the mouse pointer while the clicker is armed (hold mode) or running (start/stop).
+    readonly pxdCheckBox chkDot = new() { Text = "Dot by the mouse pointer while it's on", Checked = true };
+    readonly CursorDot dot = new();
+    bool dotOn = true;
     bool autostartLaunch, muteNextToggle;
-    HookProc? hookProc;         // kept as a field so the GC doesn't collect the delegate
+    HookProc? hookProc;        // kept as a field so the GC doesn't collect the delegate
     IntPtr hook;
     volatile bool physLeftDown;  // the real button state, ignoring clicks we inject
     CancellationTokenSource? holdCts;
@@ -635,12 +756,12 @@ class ClickerForm : Form
     readonly Button btnToggleKey = new() { Width = 110 };
     readonly Button btnModKey = new() { Width = 110 };
 
-    readonly PaxNumericUpDown nCps = new() { Minimum = 1, Maximum = 500, Value = 20, Width = 70 };
-    readonly PaxNumericUpDown nCount = new() { Minimum = 0, Maximum = 10_000_000, Value = 0, Width = 90 };
-    readonly PaxNumericUpDown nStartDelay = new() { Minimum = 0, Maximum = 60, Value = 3, Width = 50 };
-    readonly PaxComboBox cbButton = new() { Width = 90 };
-    readonly PaxTrackBar tbVolume = new() { Minimum = 0, Maximum = 100, Value = 70, TickFrequency = 10, Width = 120, AutoSize = false, Height = 28 };
-    readonly Label lblVolume = new() { AutoSize = true, ForeColor = PaxTheme.Muted };
+    readonly pxdNumericUpDown nCps = new() { Minimum = 1, Maximum = 500, Value = 20, Width = 70 };
+    readonly pxdNumericUpDown nCount = new() { Minimum = 0, Maximum = 10_000_000, Value = 0, Width = 90 };
+    readonly pxdNumericUpDown nStartDelay = new() { Minimum = 0, Maximum = 60, Value = 3, Width = 50 };
+    readonly pxdComboBox cbButton = new() { Width = 90 };
+    readonly pxdTrackBar tbVolume = new() { Minimum = 0, Maximum = 100, Value = 70, TickFrequency = 10, Width = 120, AutoSize = false, Height = 28 };
+    readonly Label lblVolume = new() { AutoSize = true, ForeColor = pxdTheme.Muted };
     readonly Button btn = new() { Text = "Start", Width = 120, Height = 36 };
     readonly Label status = new() { AutoSize = false, Text = "Stopped", TextAlign = ContentAlignment.MiddleLeft };
     readonly Button btnExit = new() { Text = "Exit", Width = 70, Height = 36 };
@@ -650,21 +771,21 @@ class ClickerForm : Form
     public ClickerForm(EventWaitHandle? showRequest = null)
     {
         this.showRequest = showRequest;
-        Text = "PAX Auto Clicker";
+        Text = "pxd Auto Clicker";
         Icon = AppIcon(new Size(32, 32));
         ClientSize = new Size(380, 250);
-        FormBorderStyle = FormBorderStyle.None; // the PAX title bar replaces the system one
+        FormBorderStyle = FormBorderStyle.None; // the pxd title bar replaces the system one
         MaximizeBox = false;
         Font = new Font("Segoe UI", 9);
         TopMost = true;
         Controls.Add(body);
         Controls.Add(bar); // added last so it docks first, above the body
-        // PAX dark theme: labels and check boxes take the body's colours; the inputs are styled below
-        BackColor = PaxTheme.Back;
-        body.BackColor = PaxTheme.Back;
-        body.ForeColor = PaxTheme.Text;
-        foreach (var b in new[] { btnToggleKey, btnHoldKey, btnModKey }) PaxTheme.RaisedButton(b);
-        PaxTheme.PrimaryButton(btn);
+        // pxd dark theme: labels and check boxes take the body's colours; the inputs are styled below
+        BackColor = pxdTheme.Back;
+        body.BackColor = pxdTheme.Back;
+        body.ForeColor = pxdTheme.Text;
+        foreach (var b in new[] { btnToggleKey, btnHoldKey, btnModKey }) pxdTheme.RaisedButton(b);
+        pxdTheme.PrimaryButton(btn);
 
         cbButton.Items.AddRange(new object[] { "Left", "Right", "Middle" }); cbButton.SelectedIndex = 0;
 
@@ -673,7 +794,7 @@ class ClickerForm : Form
         {
             body.Controls.Add(new Label { Text = label, Left = 14, Top = y + 4, AutoSize = true });
             c.Left = 170; c.Top = y; body.Controls.Add(c);
-            if (hint != null) body.Controls.Add(new Label { Text = hint, Left = c.Right + 6, Top = y + 4, AutoSize = true, ForeColor = PaxTheme.Muted });
+            if (hint != null) body.Controls.Add(new Label { Text = hint, Left = c.Right + 6, Top = y + 4, AutoSize = true, ForeColor = pxdTheme.Muted });
             y += 32;
         }
         Row("Clicks per second", nCps);
@@ -690,6 +811,7 @@ class ClickerForm : Form
         chkHold.CheckedChanged += (_, _) =>
         {
             if (chkHold.Checked) StartHoldMode(); else StopHoldMode();
+            UpdateDot();
             // Only the silent auto-enable at Windows startup skips the sound; tray/hidden toggles still play it.
             if (muteNextToggle) muteNextToggle = false; else PlayToggleSound(chkHold.Checked);
         };
@@ -700,6 +822,9 @@ class ClickerForm : Form
         chkTick.Left = 14; chkTick.Top = y; body.Controls.Add(chkTick);
         chkTick.CheckedChanged += (_, _) => tickOn = chkTick.Checked;
         y += 24;
+        chkDot.Left = 14; chkDot.Top = y; body.Controls.Add(chkDot);
+        chkDot.CheckedChanged += (_, _) => { dotOn = chkDot.Checked; UpdateDot(); };
+        y += 24;
         chkAuto.Left = 14; chkAuto.Top = y; body.Controls.Add(chkAuto);
         y += 24;
         chkTray.Left = 14; chkTray.Top = y; body.Controls.Add(chkTray);
@@ -707,7 +832,7 @@ class ClickerForm : Form
         ClientSize = new Size(380, bar.Height + y + 60);
 
         LoadSettings();
-        if (savedPos is { } pos && PaxPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
+        if (savedPos is { } pos && pxdPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
         {
             StartPosition = FormStartPosition.Manual;
             Location = pos;
@@ -725,17 +850,17 @@ class ClickerForm : Form
         autostartLaunch = Environment.GetCommandLineArgs().Contains("--autostart");
 
         // tray: minimizing hides the window; double-click, menu or Shift+F12 restores it.
-        // PAX Toolkit (toolkit.json) and the "Show tray icon" box both decide whether the icon shows.
-        ApplyTrayLink(PaxLink.TrayIconVisible(App.Id));
+        // pxd Toolkit (toolkit.json) and the "Show tray icon" box both decide whether the icon shows.
+        ApplyTrayLink(pxdLink.TrayIconVisible(App.Id));
         chkTray.CheckedChanged += (_, _) =>
         {
             if (applyingLink) return;
             tray.Visible = chkTray.Checked;
-            PaxLink.SetTrayIconVisible(App.Id, chkTray.Checked);
+            pxdLink.SetTrayIconVisible(App.Id, chkTray.Checked);
         };
-        linkWatch = PaxLink.Watch(() =>
+        linkWatch = pxdLink.Watch(() =>
         {
-            bool on = PaxLink.TrayIconVisible(App.Id);
+            bool on = pxdLink.TrayIconVisible(App.Id);
             try { if (IsHandleCreated && !IsDisposed) BeginInvoke(() => ApplyTrayLink(on)); } catch (InvalidOperationException) { }
         });
         tray.ContextMenuStrip = new ContextMenuStrip();
@@ -751,7 +876,7 @@ class ClickerForm : Form
 
         btn.Left = 14; btn.Top = y + 6; btn.Click += (_, _) => Toggle();
         btnExit.Left = 380 - 14 - btnExit.Width; btnExit.Top = y + 6; btnExit.Click += (_, _) => ExitApp();
-        PaxTheme.RaisedButton(btnExit);
+        pxdTheme.RaisedButton(btnExit);
         status.Bounds = new Rectangle(btn.Right + 12, y + 6, btnExit.Left - btn.Right - 18, 36); // wraps to two lines if needed
         body.Controls.Add(btn); body.Controls.Add(status); body.Controls.Add(btnExit);
 
@@ -766,12 +891,12 @@ class ClickerForm : Form
                     try { if (IsHandleCreated && !IsDisposed) BeginInvoke(RestoreFromTray); } catch (InvalidOperationException) { }
                 }, null, Timeout.Infinite, false);
         };
-        // X only hides; Alt+F4 and the taskbar's Close are caught in WndProc. A plain WM_CLOSE (PAX Toolkit
+        // X only hides; Alt+F4 and the taskbar's Close are caught in WndProc. A plain WM_CLOSE (pxd Toolkit
         // closing it to update, Windows shutdown) still quits normally so settings get saved.
         bar.CloseAction = HideWindow;
         FormClosing += (_, _) =>
         {
-            showWait?.Unregister(null); linkWatch?.Dispose(); if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId);
+            showWait?.Unregister(null); linkWatch?.Dispose(); if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook); ring.Close(); dot.Close(); SaveSettings(); tray.Visible = false; cts?.Cancel(); StopHoldMode(); UnregisterHotKey(Handle, HotkeyId); UnregisterHotKey(Handle, ShowHotkeyId);
         };
     }
 
@@ -830,6 +955,7 @@ class ClickerForm : Form
                 tbVolume.Value = Math.Clamp(Convert.ToInt32(k.GetValue("Volume", 70)), 0, 100);
                 chkTick.Checked = tickOn = Convert.ToInt32(k.GetValue("Tick", 0)) != 0;
                 chkRing.Checked = ringOn = Convert.ToInt32(k.GetValue("Ring", 1)) != 0;
+                chkDot.Checked = dotOn = Convert.ToInt32(k.GetValue("CursorDot", 1)) != 0;
                 if (k.GetValue("WindowX") is int wx && k.GetValue("WindowY") is int wy) savedPos = new Point(wx, wy);
             }
             using var r = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, true);
@@ -839,7 +965,7 @@ class ClickerForm : Form
                 r.DeleteValue(LegacyRunName, false);
                 r.SetValue(RunName, $"\"{Environment.ProcessPath}\" --autostart");
             }
-            // keep "Start with Windows" pointing at this copy (e.g. after PAX Toolkit installs it somewhere new)
+            // keep "Start with Windows" pointing at this copy (e.g. after pxd Toolkit installs it somewhere new)
             string runValue = $"\"{Environment.ProcessPath}\" --autostart";
             if (r?.GetValue(RunName) is string current && !string.Equals(current, runValue, StringComparison.OrdinalIgnoreCase))
                 r.SetValue(RunName, runValue);
@@ -861,9 +987,10 @@ class ClickerForm : Form
             k.SetValue("Volume", tbVolume.Value);
             k.SetValue("Tick", tickOn ? 1 : 0);
             k.SetValue("Ring", ringOn ? 1 : 0);
+            k.SetValue("CursorDot", dotOn ? 1 : 0);
             // window position (fixed size); RestoreBounds gives the normal spot while minimized/hidden
             var pos = WindowState == FormWindowState.Normal ? Location : RestoreBounds.Location;
-            if (IsHandleCreated && PaxPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
+            if (IsHandleCreated && pxdPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
             {
                 k.SetValue("WindowX", pos.X, Microsoft.Win32.RegistryValueKind.DWord);
                 k.SetValue("WindowY", pos.Y, Microsoft.Win32.RegistryValueKind.DWord);
@@ -1086,6 +1213,7 @@ class ClickerForm : Form
         int delay = (int)nStartDelay.Value;
         var (down, up) = cbButton.SelectedIndex switch { 1 => (0x0008u, 0x0010u), 2 => (0x0020u, 0x0040u), _ => (0x0002u, 0x0004u) };
         btn.Text = "Stop"; clicks = 0;
+        UpdateDot();
 
         _ = Task.Run(async () =>
         {
@@ -1114,12 +1242,16 @@ class ClickerForm : Form
             catch (OperationCanceledException) { }
             finally
             {
-                BeginInvoke(() => { btn.Text = "Start"; status.Text = $"Stopped ({clicks} clicks)"; cts?.Dispose(); cts = null; });
+                BeginInvoke(() => { btn.Text = "Start"; status.Text = $"Stopped ({clicks} clicks)"; cts?.Dispose(); cts = null; UpdateDot(); });
             }
         });
     }
 
     void SetStatus(string t) => BeginInvoke(() => status.Text = t);
+
+    // amber while the start/stop clicker runs, green while hold mode is armed
+    void UpdateDot() => dot.Mode = !dotOn ? CursorDot.State.Off : cts != null ? CursorDot.State.Clicking
+        : chkHold.Checked ? CursorDot.State.Armed : CursorDot.State.Off;
 
     static void Click(uint down, uint up)
     {
@@ -1129,6 +1261,113 @@ class ClickerForm : Form
             new() { type = 0, mi = new MOUSEINPUT { flags = up } },
         };
         SendInput(2, inputs, Marshal.SizeOf<INPUT>());
+    }
+}
+
+// Click-through dot that rides just below-right of the mouse pointer while the clicker is on. Drawn with per-pixel
+// alpha (UpdateLayeredWindow) so its edges are smooth, and pushed back to the top of the z-order regularly so
+// borderless-windowed games that make themselves topmost don't cover it. Exclusive-fullscreen games still can.
+class CursorDot : Form
+{
+    public enum State { Off, Armed, Clicking }
+
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SIZE { public int W, H; }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLENDFUNCTION { public byte Op, Flags, Alpha, Format; }
+    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT pos, ref SIZE size, IntPtr src, ref POINT srcPos, int key, ref BLENDFUNCTION blend, int flags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    static readonly IntPtr HWND_TOPMOST = new(-1);
+    const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40, SWP_HIDEWINDOW = 0x80;
+
+    readonly System.Windows.Forms.Timer timer = new() { Interval = 15 };
+    readonly int size, offX, offY;
+    State mode;
+    POINT last = new() { X = int.MinValue };
+    int ticks;
+
+    public CursorDot()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        CreateHandle();
+        float s = DeviceDpi / 96f;
+        size = (int)Math.Round(20 * s);
+        // the arrow pointer covers roughly 12x19 px down-right of its tip; sit just past it
+        offX = (int)Math.Round(14 * s); offY = (int)Math.Round(16 * s);
+        timer.Tick += (_, _) => Follow();
+    }
+
+    protected override bool ShowWithoutActivation => true;
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            // layered | transparent (click-through) | toolwindow (no alt-tab) | noactivate | topmost
+            cp.ExStyle |= 0x80000 | 0x20 | 0x80 | 0x08000000 | 0x8;
+            return cp;
+        }
+    }
+
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public State Mode
+    {
+        get => mode;
+        set
+        {
+            if (value == mode) return;
+            mode = value;
+            // shown and hidden straight through SetWindowPos, so WinForms' Visible isn't involved
+            if (mode == State.Off) { timer.Stop(); SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW); return; }
+            Draw(mode == State.Armed ? pxdTheme.Accent : Color.FromArgb(255, 255, 176, 32));
+            last.X = int.MinValue;
+            Follow();
+            timer.Start();
+        }
+    }
+
+    void Follow()
+    {
+        if (!GetCursorPos(out var p)) return;
+        bool moved = p.X != last.X || p.Y != last.Y;
+        if (!moved && ++ticks % 20 != 0) return; // re-assert topmost about 3 times a second even when still
+        last = p;
+        SetWindowPos(Handle, HWND_TOPMOST, p.X + offX, p.Y + offY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    void Draw(Color fill)
+    {
+        using var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float c = size / 2f, r = size * 0.3f;
+            using (var glow = new SolidBrush(Color.FromArgb(70, fill))) g.FillEllipse(glow, c - r - 3.5f * size / 20, c - r - 3.5f * size / 20, (r + 3.5f * size / 20) * 2, (r + 3.5f * size / 20) * 2);
+            using (var edge = new SolidBrush(Color.FromArgb(230, 14, 16, 21))) g.FillEllipse(edge, c - r - 1.5f, c - r - 1.5f, (r + 1.5f) * 2, (r + 1.5f) * 2);
+            using (var core = new SolidBrush(fill)) g.FillEllipse(core, c - r, c - r, r * 2, r * 2);
+        }
+        IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen), hbmp = bmp.GetHbitmap(Color.FromArgb(0)), old = SelectObject(mem, hbmp);
+        try
+        {
+            var pos = new POINT { X = Left, Y = Top };
+            var sz = new SIZE { W = size, H = size };
+            var src = new POINT();
+            var blend = new BLENDFUNCTION { Op = 0, Flags = 0, Alpha = 255, Format = 1 }; // AC_SRC_ALPHA
+            UpdateLayeredWindow(Handle, screen, ref pos, ref sz, mem, ref src, 0, ref blend, 2); // ULW_ALPHA
+        }
+        finally
+        {
+            SelectObject(mem, old); DeleteObject(hbmp); DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen);
+        }
     }
 }
 
@@ -1195,5 +1434,104 @@ class ClickRing : Form
         float r = 8 + (float)t * 24;
         using var pen = new Pen(Color.Lime, 3);
         e.Graphics.DrawEllipse(pen, Size_ / 2f - r, Size_ / 2f - r, r * 2, r * 2);
+    }
+}
+
+// --self-test: checks the one-time move from the former name without a window, the real settings or the real Run key.
+// Uses a scratch registry key (HKCU\Software\pxdAutoClicker.SelfTest-<guid>) and a temp folder, both removed at the end.
+// Prints PASS/FAIL lines; the exit code is the number of failures.
+static class SelfTest
+{
+    public static int Run()
+    {
+        int failed = 0;
+        void Check(bool ok, string what)
+        {
+            Console.WriteLine((ok ? "PASS " : "FAIL ") + what);
+            if (!ok) failed++;
+        }
+
+        var tag = App.Id + ".SelfTest-" + Guid.NewGuid().ToString("N");
+        var root = @"Software\" + tag;
+        var temp = Path.Combine(Path.GetTempPath(), tag);
+        var hkcu = Microsoft.Win32.Registry.CurrentUser;
+        var former = pxdMigrate.FormerName(App.Id);
+        try
+        {
+            Check(former != App.Id && former.EndsWith("AutoClicker", StringComparison.Ordinal), "former name differs from the new one");
+
+            // Settings key: moved once, with its values and subkeys; a second start changes nothing.
+            string oldKey = root + @"\" + former, newKey = root + @"\" + App.Id;
+            using (var k = hkcu.CreateSubKey(oldKey))
+            {
+                k.SetValue("Cps", 37);
+                k.SetValue("WindowX", -1200);
+                using var sub = k.CreateSubKey("Extra");
+                sub.SetValue("Note", "kept");
+            }
+            Check(pxdMigrate.RegistryKey(oldKey, newKey), "settings key moves on the first start");
+            using (var o = hkcu.OpenSubKey(oldKey)) Check(o == null, "former settings key is gone");
+            using (var n = hkcu.OpenSubKey(newKey))
+            {
+                Check(n?.GetValue("Cps") is int cps && cps == 37, "settings values kept");
+                Check(n?.GetValue("WindowX") is int wx && wx == -1200, "window position kept");
+                using var sub = n?.OpenSubKey("Extra");
+                Check(sub?.GetValue("Note") as string == "kept", "subkeys kept");
+            }
+            using (var n = hkcu.CreateSubKey(newKey)) n.SetValue("Cps", 41);
+            Check(!pxdMigrate.RegistryKey(oldKey, newKey), "second start: nothing to move");
+            using (var k = hkcu.CreateSubKey(oldKey)) k.SetValue("Cps", 99);
+            Check(!pxdMigrate.RegistryKey(oldKey, newKey), "former key next to a new one: not moved");
+            using (var n = hkcu.OpenSubKey(newKey)) Check(n?.GetValue("Cps") is int c2 && c2 == 41, "new settings never overwritten");
+
+            // Run entry: moved with its arguments and Task Manager's state, pointing at the new exe; never created.
+            string run = root + @"\Run", approved = root + @"\Approved";
+            const string newExe = @"C:\Users\Someone\Apps\pxdAutoClicker\pxdAutoClicker.exe";
+            Check(!pxdMigrate.RunEntry(run, approved, former, App.Id, newExe), "no former Run value: nothing done");
+            using (var r = hkcu.OpenSubKey(run)) Check(r?.GetValue(App.Id) == null, "no Run value created");
+            using (var r = hkcu.CreateSubKey(run)) r.SetValue(former, $"\"{Path.Combine(@"C:\Old", former + ".exe")}\" --autostart");
+            byte[] disabled = [3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+            using (var a = hkcu.CreateSubKey(approved)) a.SetValue(former, disabled, Microsoft.Win32.RegistryValueKind.Binary);
+            Check(pxdMigrate.RunEntry(run, approved, former, App.Id, newExe), "Run value moves on the first start");
+            using (var r = hkcu.OpenSubKey(run))
+            {
+                Check(r?.GetValue(App.Id) as string == $"\"{newExe}\" --autostart", "new Run value points at the new exe with --autostart");
+                Check(r?.GetValue(former) == null, "former Run value gone");
+            }
+            using (var a = hkcu.OpenSubKey(approved))
+                Check(a?.GetValue(App.Id) is byte[] st && st.SequenceEqual(disabled) && a.GetValue(former) == null, "Task Manager's disabled state carried over");
+            Check(!pxdMigrate.RunEntry(run, approved, former, App.Id, newExe), "second start: Run value left alone");
+
+            // Shared Toolkit file: copied once with the app ids renamed; an existing new file is never replaced.
+            string oldFile = Path.Combine(temp, "old", "toolkit.json"), newDir = Path.Combine(temp, "new"), newFile = Path.Combine(newDir, "toolkit.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(oldFile)!);
+            var formerApps = new JsonObject
+            {
+                [former] = new JsonObject { ["trayIcon"] = false },
+                [pxdMigrate.FormerName("pxdCommander")] = new JsonObject { ["trayIcon"] = true },
+            };
+            File.WriteAllText(oldFile, new JsonObject { ["schema"] = 1, ["apps"] = formerApps }.ToJsonString());
+            Check(pxdMigrate.SharedFile(oldFile, newFile), "toolkit.json copied on the first start");
+            var apps = JsonNode.Parse(File.ReadAllText(newFile))?["apps"] as JsonObject;
+            Check(apps?[App.Id]?["trayIcon"]?.GetValue<bool>() == false && apps.ContainsKey("pxdCommander") && !apps.ContainsKey(former), "app ids renamed, values kept");
+            Check(File.Exists(oldFile), "former file left for apps not updated yet");
+            Environment.SetEnvironmentVariable("PXD_SHARED_DIR", newDir);
+            Check(!pxdLink.TrayIconVisible(App.Id), "the link reads the copied setting");
+            pxdLink.SetTrayIconVisible(App.Id, true);
+            Check(!pxdMigrate.SharedFile(oldFile, newFile), "second start: nothing copied");
+            Check(pxdLink.TrayIconVisible(App.Id), "the new file's own setting is kept");
+        }
+        catch (Exception ex)
+        {
+            Check(false, "unexpected " + ex.GetType().Name + ": " + ex.Message);
+        }
+        finally
+        {
+            try { hkcu.DeleteSubKeyTree(root, throwOnMissingSubKey: false); } catch { }
+            try { Directory.Delete(temp, recursive: true); } catch { }
+        }
+
+        Console.WriteLine(failed == 0 ? "All self-tests passed." : $"{failed} self-test(s) failed.");
+        return failed;
     }
 }
