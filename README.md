@@ -25,7 +25,8 @@
 - **Tray app.** Minimizing, the window's **X**, Alt+F4 and the taskbar's Close all hide it to the tray instead of quitting, so it keeps working in the background; double-click the tray icon or use its menu to bring it back. To quit, use the **Exit** button in the window or **Exit** in the tray menu. Untick **Show tray icon** to run without one: minimizing then keeps it on the taskbar, and starting the exe again opens the window.
 - **One copy at a time.** Starting it again while it runs brings up the running window. The window remembers where you left it.
 - **Works with [pxd Toolkit](https://github.com/joshpack/pxdToolkit)**, including turning the tray icon on or off from there.
-- **Start with Windows**, optional. It starts hidden in the tray with hold mode already on, silently.
+- **Start with Windows**, optional. It starts silently, the way you left it: hold mode on or off, and the window open or in the tray. The very first time, hold mode is on and the window is in the tray.
+- **Remembers its last state.** Hold mode on or off and whether the window was open come back after an update (from pxd Toolkit or its own self-update), a restart or Windows starting. The start/stop clicker always comes back stopped, so it never starts clicking on its own. Opening the exe yourself always shows the window. Settings are saved a second after each change, so nothing is lost even if an update has to stop it.
 - **No install, no admin rights.** One folder; settings live in the current user's registry.
 
 ## Supported systems
@@ -65,13 +66,13 @@ If another program already uses the start/stop key or Shift + F12, the status li
 
 | Option | What it does |
 | --- | --- |
-| `--autostart` | Starts hidden in the tray with hold mode on and no chime. "Start with Windows" uses this. |
+| `--autostart` | Starts with no chime, restoring the last state: hold mode on or off, and the window open only if it was open (the first time: hold mode on, in the tray). "Start with Windows" and pxd Toolkit use this. |
 | `--no-update` | Opens without checking for a newer release first. |
 | `--self-test` | Checks the one-time move from the app's earlier name (in a scratch registry key and a temp folder) and updating (against a fake release on a local server, in a temp folder); no window, real settings and install untouched. Prints PASS/FAIL lines; the exit code is the number of failures. |
 
 ## Settings
 
-Settings and the window position are saved when the app closes, in the registry under `HKEY_CURRENT_USER\Software\pxdAutoClicker`. Whether the tray icon shows is kept in `%APPDATA%\pxd\toolkit.json` (`apps.pxdAutoClicker.trayIcon`), shared with pxd Toolkit. "Start with Windows" is the `pxdAutoClicker` value under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`. Settings from older builds, under the app's earlier names, are picked up automatically: on its first start, 1.3.0 moves them, an existing "Start with Windows" entry and the pxd Toolkit setting to the names above.
+Settings, the window position and the last state (`HoldOn`, `WindowOpen`) are saved a second after each change and when the app closes, in the registry under `HKEY_CURRENT_USER\Software\pxdAutoClicker`. Whether the tray icon shows is kept in `%APPDATA%\pxd\toolkit.json` (`apps.pxdAutoClicker.trayIcon`), shared with pxd Toolkit. "Start with Windows" is the `pxdAutoClicker` value under `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`. Settings from older builds, under the app's earlier names, are picked up automatically: on its first start, 1.3.0 moves them, an existing "Start with Windows" entry and the pxd Toolkit setting to the names above.
 
 ## Uninstall
 

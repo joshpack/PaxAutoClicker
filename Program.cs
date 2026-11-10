@@ -932,6 +932,10 @@ class ClickerForm : Form
     readonly CursorDot dot = new();
     bool dotOn = true;
     bool autostartLaunch, muteNextToggle;
+    // last state, kept across updates and restarts; null = never saved
+    bool? savedHold, savedOpen;
+    bool loaded; // settings are only saved once startup has applied them
+    readonly System.Windows.Forms.Timer saveTimer = new() { Interval = 1000 };
     HookProc? hookProc;        // kept as a field so the GC doesn't collect the delegate
     IntPtr hook;
     volatile bool physLeftDown;  // the real button state, ignoring clicks we inject
@@ -1065,8 +1069,24 @@ class ClickerForm : Form
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized && tray.Visible) Hide(); };
         Shown += (_, _) =>
         {
-            if (autostartLaunch) { muteNextToggle = true; chkHold.Checked = true; WindowState = FormWindowState.Minimized; Hide(); }
+            // Hold mode comes back the way it was left (updates, restarts, Windows startup). The first ever
+            // --autostart turns it on; the start/stop clicker is never resumed on its own.
+            var (hold, hide) = StartupState(savedHold, savedOpen, autostartLaunch);
+            if (hold) { muteNextToggle = true; chkHold.Checked = true; }
+            // (without a tray icon it stays minimized on the taskbar, so it can still be found)
+            if (hide) { WindowState = FormWindowState.Minimized; if (tray.Visible) Hide(); }
+            loaded = true;
+            SaveSoon(); // record the state it started in, in case it's killed before anything changes
         };
+        // save shortly after any change rather than only on exit: pxd Toolkit has to kill a copy that's hidden in the
+        // tray to update it, which would otherwise lose everything since it started
+        saveTimer.Tick += (_, _) => { saveTimer.Stop(); SaveSettings(); };
+        nCps.ValueChanged += (_, _) => SaveSoon();
+        cbButton.SelectedIndexChanged += (_, _) => SaveSoon();
+        tbVolume.ValueChanged += (_, _) => SaveSoon();
+        foreach (var c in new[] { chkHold, chkRing, chkTick, chkDot }) c.CheckedChanged += (_, _) => SaveSoon();
+        VisibleChanged += (_, _) => SaveSoon();
+        LocationChanged += (_, _) => SaveSoon();
 
         btn.Left = 14; btn.Top = y + 6; btn.Click += (_, _) => Toggle();
         btnExit.Left = 380 - 14 - btnExit.Width; btnExit.Top = y + 6; btnExit.Click += (_, _) => ExitApp();
@@ -1095,6 +1115,13 @@ class ClickerForm : Form
     }
 
     void ExitApp() { tray.Visible = false; Close(); }
+
+    // --autostart (Windows startup, pxd Toolkit restarting it after an update) reopens the window only if it was
+    // open; launching the exe yourself always shows it. Hold mode is restored either way.
+    internal static (bool Hold, bool Hide) StartupState(bool? savedHold, bool? savedOpen, bool autostart) =>
+        (savedHold ?? autostart, autostart && savedOpen != true);
+
+    void SaveSoon() { if (!loaded) return; saveTimer.Stop(); saveTimer.Start(); }
 
     // with no tray icon a hidden window couldn't be found again (except Shift+F12), so minimize to the taskbar instead
     void HideWindow() { if (tray.Visible) Hide(); else WindowState = FormWindowState.Minimized; }
@@ -1151,6 +1178,8 @@ class ClickerForm : Form
                 chkRing.Checked = ringOn = Convert.ToInt32(k.GetValue("Ring", 1)) != 0;
                 chkDot.Checked = dotOn = Convert.ToInt32(k.GetValue("CursorDot", 1)) != 0;
                 if (k.GetValue("WindowX") is int wx && k.GetValue("WindowY") is int wy) savedPos = new Point(wx, wy);
+                if (k.GetValue("HoldOn") is int ho) savedHold = ho != 0;
+                if (k.GetValue("WindowOpen") is int wo) savedOpen = wo != 0;
             }
             using var r = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, true);
             if (r?.GetValue(LegacyRunName) != null)
@@ -1182,6 +1211,8 @@ class ClickerForm : Form
             k.SetValue("Tick", tickOn ? 1 : 0);
             k.SetValue("Ring", ringOn ? 1 : 0);
             k.SetValue("CursorDot", dotOn ? 1 : 0);
+            k.SetValue("HoldOn", chkHold.Checked ? 1 : 0);
+            k.SetValue("WindowOpen", Visible && WindowState != FormWindowState.Minimized ? 1 : 0);
             // window position (fixed size); RestoreBounds gives the normal spot while minimized/hidden
             var pos = WindowState == FormWindowState.Normal ? Location : RestoreBounds.Location;
             if (IsHandleCreated && pxdPlacement.IsVisible(new Rectangle(pos, Size), bar.BarHeight))
@@ -1288,6 +1319,7 @@ class ClickerForm : Form
         btnToggleKey.Text = KeyName(toggleVk);
         btnModKey.Text = KeyName(modVk);
         chkHold.Text = $"Hold {KeyName(modVk)} + Left click to spam left click";
+        SaveSoon(); // a key was rebound
     }
 
     // A bare key binding shouldn't fire for combos meant for other apps (e.g. Ctrl+Page Down).
@@ -1724,6 +1756,13 @@ static class SelfTest
             try { hkcu.DeleteSubKeyTree(root, throwOnMissingSubKey: false); } catch { }
             try { Directory.Delete(temp, recursive: true); } catch { }
         }
+
+        // Last state across updates and restarts
+        Check(ClickerForm.StartupState(null, null, autostart: true) == (true, true), "first --autostart: hold on, in the tray");
+        Check(ClickerForm.StartupState(null, null, autostart: false) == (false, false), "first plain launch: hold off, window shown");
+        Check(ClickerForm.StartupState(false, false, autostart: true) == (false, true), "--autostart after hold was turned off: stays off");
+        Check(ClickerForm.StartupState(true, true, autostart: true) == (true, false), "--autostart after leaving the window open: reopens it");
+        Check(ClickerForm.StartupState(true, false, autostart: false) == (true, false), "plain launch: hold restored, window always shown");
 
         UpdateChecks(Check);
 
