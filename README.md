@@ -41,7 +41,7 @@ It uses Windows-only APIs (low-level keyboard and mouse hooks, `SendInput`, glob
 ## Install
 
 1. Install the **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (x64) if you don't have it.
-2. Download `pxdAutoClicker-1.3.1-win-x64.zip` from **[the latest release](https://github.com/joshpack/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.1-win-x64.zip` and compare the result with the `.sha256` file next to it.
+2. Download `pxdAutoClicker-1.3.2-win-x64.zip` from **[the latest release](https://github.com/joshpack/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.2-win-x64.zip` and compare the result with the `.sha256` file next to it.
 3. Unzip it somewhere permanent. It contains one folder, `pxdAutoClicker`. Your settings live elsewhere and are kept when it updates.
 4. Run `pxdAutoClicker.exe`.
 
