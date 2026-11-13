@@ -24,7 +24,7 @@
 - **Shift + F12** shows or hides the window from anywhere, including from inside a game.
 - **Tray app.** Minimizing, the window's **X**, Alt+F4 and the taskbar's Close all hide it to the tray instead of quitting, so it keeps working in the background; double-click the tray icon or use its menu to bring it back. To quit, use the **Exit** button in the window or **Exit** in the tray menu. Untick **Show tray icon** to run without one: minimizing then keeps it on the taskbar, and starting the exe again opens the window.
 - **One copy at a time.** Starting it again while it runs brings up the running window. The window remembers where you left it.
-- **Works with [pxd Toolkit](https://github.com/joshpack/pxdToolkit)**, including turning the tray icon on or off from there.
+- **Works with [pxd Toolkit](https://github.com/pxdtek/pxdToolkit)**, including turning the tray icon on or off from there.
 - **Start with Windows**, optional. It starts silently, the way you left it: hold mode on or off, and the window open or in the tray. The very first time, hold mode is on and the window is in the tray.
 - **Remembers its last state.** Hold mode on or off and whether the window was open come back after an update (from pxd Toolkit or its own self-update), a restart or Windows starting. The start/stop clicker always comes back stopped, so it never starts clicking on its own. Opening the exe yourself always shows the window. Settings are saved a second after each change, so nothing is lost even if an update has to stop it.
 - **No install, no admin rights.** One folder; settings live in the current user's registry.
@@ -41,7 +41,7 @@ It uses Windows-only APIs (low-level keyboard and mouse hooks, `SendInput`, glob
 ## Install
 
 1. Install the **[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)** (x64) if you don't have it.
-2. Download `pxdAutoClicker-1.3.2-win-x64.zip` from **[the latest release](https://github.com/joshpack/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.2-win-x64.zip` and compare the result with the `.sha256` file next to it.
+2. Download `pxdAutoClicker-1.3.3-win-x64.zip` from **[the latest release](https://github.com/pxdtek/pxdAutoClicker/releases/latest)**. To check it in PowerShell, run `Get-FileHash pxdAutoClicker-1.3.3-win-x64.zip` and compare the result with the `.sha256` file next to it.
 3. Unzip it somewhere permanent. It contains one folder, `pxdAutoClicker`. Your settings live elsewhere and are kept when it updates.
 4. Run `pxdAutoClicker.exe`.
 

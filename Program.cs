@@ -13,7 +13,7 @@ return 0;
 static class App
 {
     public const string Id = "pxdAutoClicker";
-    public const string Repo = "joshpack/pxdAutoClicker";
+    public const string Repo = "pxdtek/pxdAutoClicker";
     public const string UpdateAsset = @"^pxdAutoClicker-.*-win-x64\.zip$";
 
     public static void Run(string[] args)
@@ -172,7 +172,8 @@ static class pxdMigrate
 }
 
 // pxd apps update themselves before they open: the same as pxdUpdate in the pxd App Standard (pxdStandard.cs), for
-// this WinForms app. Checks the latest GitHub release (4 s at most), and when it's newer downloads the Windows zip, checks
+// this WinForms app. Checks the latest release on pxdtek.com, or on GitHub (pxdtek) when pxdtek.com fails or answers with
+// a block page (4 s at most), and when it's newer downloads the Windows zip, checks
 // its .sha256, swaps the files in the exe's folder (the old ones are set aside as *.pxdold and removed at the next start)
 // and starts the new exe with the same arguments. Skipped for bin\ / obj\ builds, --self-test, --no-update and
 // PXD_NO_UPDATE=1. PXD_UPDATE_API points it at another server (tests). Never stops the app from opening.
@@ -221,12 +222,48 @@ static class pxdUpdate
         return m.Success ? new Version(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0) : null;
     }
 
-    // The newer release's zip (and checksum) URLs, or null when this copy is current or GitHub can't be asked.
+    // Where release info is asked for, in order: pxdtek.com (it fetches from GitHub on its side, so clients only ever talk
+    // to pxdtek.com), then GitHub itself for networks that block pxdtek.com. PXD_UPDATE_API replaces both (tests); unlike
+    // the Avalonia copy it may list several servers separated by ';', so the self-test can check the fallback locally.
+    public static string[] ApiBases() =>
+        Environment.GetEnvironmentVariable("PXD_UPDATE_API") is { Length: > 0 } a
+            ? a.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(b => b.TrimEnd('/')).ToArray()
+            : ["https://pxdtek.com/gh", "https://api.github.com"];
+
+    // pxdtek.com's copy of a GitHub release download -> the same file on GitHub (the fallback).
+    public static string? GitHubCopy(string url)
+    {
+        var m = Regex.Match(url, @"^https://pxdtek\.com/dl/([^/]+)/([^/]+)/([^/]+)$");
+        return m.Success ? $"https://github.com/pxdtek/{m.Groups[1].Value}/releases/download/{m.Groups[2].Value}/{m.Groups[3].Value}" : null;
+    }
+
+    static async Task<string> GetWithFallbackAsync(HttpClient http, string url)
+    {
+        try { return await http.GetStringAsync(url); }
+        catch when (GitHubCopy(url) is not null) { return await http.GetStringAsync(GitHubCopy(url)); }
+    }
+
+    // The newer release's zip (and checksum) URLs, or null when this copy is current or nothing could be asked.
     public static async Task<(string Zip, string? Sum)?> FindUpdateAsync(string repo, string assetPattern, Version current)
     {
-        var api = Environment.GetEnvironmentVariable("PXD_UPDATE_API") is { Length: > 0 } a ? a.TrimEnd('/') : "https://api.github.com";
         using var http = Client(TimeSpan.FromSeconds(4));
-        using var doc = JsonDocument.Parse(await http.GetStringAsync($"{api}/repos/{repo}/releases/latest"));
+        JsonDocument? doc = null;
+        foreach (var api in ApiBases())
+        {
+            try
+            {
+                var parsed = JsonDocument.Parse(await http.GetStringAsync($"{api}/repos/{repo}/releases/latest"));
+                if (parsed.RootElement.ValueKind == JsonValueKind.Object && parsed.RootElement.TryGetProperty("tag_name", out _))
+                {
+                    doc = parsed;
+                    break;
+                }
+                parsed.Dispose();
+            }
+            catch { /* blocked, offline or not JSON (a filter's block page): try the next */ }
+        }
+        if (doc is null) return null;
+        using var release = doc;
         var root = doc.RootElement;
         if (ParseVersion(root.GetProperty("tag_name").GetString()) is not { } latest || latest <= current) return null;
         string? zip = null, sum = null, zipName = null;
@@ -258,12 +295,22 @@ static class pxdUpdate
             var zip = Path.Combine(stage, "update.zip");
             using (var http = Client(TimeSpan.FromMinutes(5)))
             {
-                await using (var src = await http.GetStreamAsync(zipUrl))
-                await using (var dst = File.Create(zip))
+                try
+                {
+                    await using var src = await http.GetStreamAsync(zipUrl);
+                    await using var dst = File.Create(zip);
                     await src.CopyToAsync(dst);
+                }
+                catch when (GitHubCopy(zipUrl) is { } alt)
+                {
+                    // pxdtek.com blocked or down: the same file straight from GitHub.
+                    await using var src = await http.GetStreamAsync(alt);
+                    await using var dst = File.Create(zip);
+                    await src.CopyToAsync(dst);
+                }
                 if (sumUrl is not null)
                 {
-                    var expected = Regex.Match(await http.GetStringAsync(sumUrl), "[0-9a-fA-F]{64}").Value;
+                    var expected = Regex.Match(await GetWithFallbackAsync(http, sumUrl), "[0-9a-fA-F]{64}").Value;
                     await using var fs = File.OpenRead(zip);
                     var actual = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(fs));
                     if (expected.Length == 64 && !expected.Equals(actual, StringComparison.OrdinalIgnoreCase)) return false;
@@ -1830,8 +1877,12 @@ static class SelfTest
                         "/repos/" + App.Repo + "/releases/latest" => System.Text.Encoding.UTF8.GetBytes(new JsonObject { ["tag_name"] = "v9.0.0", ["assets"] = assets }.ToJsonString()),
                         "/zip" => File.ReadAllBytes(zip),
                         "/sum" => System.Text.Encoding.ASCII.GetBytes((badSum ? new string('0', 64) : hash) + "  " + asset),
+                        // A web filter's block page in place of the release info or the download.
+                        "/blocked/repos/" + App.Repo + "/releases/latest" or "/html" =>
+                            System.Text.Encoding.UTF8.GetBytes("<!DOCTYPE html><html><body><h1>Blocked by your network</h1></body></html>"),
                         _ => [],
                     };
+                    if (ctx.Request.Url.AbsolutePath is "/html" || ctx.Request.Url.AbsolutePath.StartsWith("/blocked/")) ctx.Response.ContentType = "text/html";
                     ctx.Response.StatusCode = body.Length == 0 ? 404 : 200;
                     await ctx.Response.OutputStream.WriteAsync(body);
                     ctx.Response.Close();
@@ -1842,6 +1893,23 @@ static class SelfTest
             var plan = pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(1, 3, 1)).GetAwaiter().GetResult();
             Check(plan is { } p && p.Zip == prefix + "zip" && p.Sum == prefix + "sum", "update: newer release found, with its checksum");
             Check(pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(9, 0, 0)).GetAwaiter().GetResult() is null, "update: current copy left alone");
+
+            // pxdtek.com first, GitHub as the fallback; a block page is never taken for the real thing.
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", null);
+            Check(string.Join("|", pxdUpdate.ApiBases()) == "https://pxdtek.com/gh|https://api.github.com", "update: pxdtek.com asked first, then GitHub");
+            Check(pxdUpdate.GitHubCopy("https://pxdtek.com/dl/pxdAutoClicker/v1.3.3/pxdAutoClicker-1.3.3-win-x64.zip")
+                  == "https://github.com/pxdtek/pxdAutoClicker/releases/download/v1.3.3/pxdAutoClicker-1.3.3-win-x64.zip"
+                  && pxdUpdate.GitHubCopy(prefix + "zip") is null, "update: downloads and checksums fall back to GitHub's copy");
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", prefix + "blocked");
+            Check(pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(1, 3, 1)).GetAwaiter().GetResult() is null, "update: a block page as release info is never accepted");
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", prefix + "blocked;" + prefix.TrimEnd('/'));
+            var viaFallback = pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(1, 3, 1)).GetAwaiter().GetResult();
+            Check(viaFallback is { } vf && vf.Zip == prefix + "zip", "update: first server answers a block page -> the next one is used");
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", "http://127.0.0.1:1;" + prefix.TrimEnd('/'));
+            Check(pxdUpdate.FindUpdateAsync(App.Repo, App.UpdateAsset, new Version(1, 3, 1)).GetAwaiter().GetResult() is { } vd && vd.Zip == prefix + "zip", "update: first server down -> the next one is used");
+            Environment.SetEnvironmentVariable("PXD_UPDATE_API", prefix.TrimEnd('/'));
+            Check(!pxdUpdate.ApplyAsync(prefix + "html", null, app, exe, ["--autostart"], start: false).GetAwaiter().GetResult()
+                  && File.ReadAllText(exe) == "old exe" && !File.Exists(Path.Combine(app, "extra.json")), "update: a block page as the download is never applied");
 
             badSum = true;
             var refused = !pxdUpdate.ApplyAsync(plan!.Value.Zip, plan.Value.Sum, app, exe, ["--autostart"], start: false).GetAwaiter().GetResult();
